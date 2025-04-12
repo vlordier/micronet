@@ -1,0 +1,2 @@
+from .default_static_qconfig import default_static_qconfig
+from .default_qat_qconfig import default_qat_qconfig

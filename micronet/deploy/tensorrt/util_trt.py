@@ -34,7 +34,6 @@ def get_engine(
         with trt.Builder(TRT_LOGGER) as builder, builder.create_network(
             1
         ) as network, trt.OnnxParser(network, TRT_LOGGER) as parser:
-
             # parse onnx model file
             if not os.path.exists(onnx_file_path):
                 quit("ONNX file {} not found".format(onnx_file_path))

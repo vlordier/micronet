@@ -139,6 +139,7 @@ class OCRBatchStream():
             return np.array([])
 """
 
+
 # segmentation
 class SegBatchStream:
     def __init__(self, dataset, transform, batch_size, img_size, max_batches):

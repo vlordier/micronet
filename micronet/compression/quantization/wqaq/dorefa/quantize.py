@@ -40,8 +40,10 @@ class ActivationQuantizer(nn.Module):
             print("！Binary quantization is not supported ！")
             assert self.a_bits != 1
         else:
-            output = torch.clamp(input * 0.1, 0, 1)  # 特征A截断前先进行缩放（* 0.1），以减小截断误差
-            scale = 1 / float(2 ** self.a_bits - 1)  # scale
+            output = torch.clamp(
+                input * 0.1, 0, 1
+            )  # 特征A截断前先进行缩放（* 0.1），以减小截断误差
+            scale = 1 / float(2**self.a_bits - 1)  # scale
             output = self.round(output / scale) * scale  # 量化/反量化
         return output
 
@@ -67,7 +69,7 @@ class WeightQuantizer(nn.Module):
         else:
             output = torch.tanh(input)
             output = output / 2 / torch.max(torch.abs(output)) + 0.5  # 归一化-[0,1]
-            scale = 1 / float(2 ** self.w_bits - 1)  # scale
+            scale = 1 / float(2**self.w_bits - 1)  # scale
             output = self.round(output / scale) * scale  # 量化/反量化
             output = 2 * output - 1
         return output

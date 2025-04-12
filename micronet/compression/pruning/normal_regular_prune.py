@@ -140,6 +140,7 @@ pruned_ratio = float(pruned / total)
 print("\r\n!预剪枝完成!")
 print("total_pruned_ratio: ", pruned_ratio)
 
+
 # ********************************预剪枝后model测试*********************************
 def test():
     test_loader = torch.utils.data.DataLoader(
