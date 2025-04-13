@@ -48,7 +48,58 @@ if not logger.hasHandlers():
 
 
 class Quantizer:
+    """
+    管理使用 torch.fx 对 PyTorch 模型进行量化准备过程的核心类。
+
+    此类负责接收一个原始的 nn.Module 模型和一个 QConfig 量化配置对象。
+    它的主要功能是通过符号追踪（Symbolic Tracing）获取模型的计算图（FX Graph），
+    然后根据 QConfig 中的设定，在图中的适当位置（例如，特定模块的权重之前，
+    或特定操作/模块的输出之后）插入量化节点（通常是 Observer 或 FakeQuantize 模块）。
+
+    主要工作流程集中在 `prepare` 方法中，该方法执行以下操作：
+    1. 使用 `torch.fx` 追踪原始模型，生成计算图。
+    2. 遍历计算图中的节点。
+    3. 根据节点的类型（调用模块、函数、方法、占位符）和 `QConfig` 的配置，
+       判断是否需要插入权重量化器或激活量化器。
+    4. 在图中插入相应的量化模块（来自 `QConfig`）。
+    5. 返回一个修改后的、包含量化节点的 `torch.fx.GraphModule`。
+
+    这个准备好的模型随后可以用于：
+    - 后训练量化（PTQ）的校准（Calibration）阶段：运行数据通过模型以收集统计信息。
+    - 量化感知训练（QAT）：在训练过程中模拟量化效应。
+
+    Attributes:
+        qconfig (QConfig): 存储量化配置，指定用于权重和激活的量化器模块工厂。
+        debug (bool): 控制是否启用详细的调试日志输出。
+        logger (logging.Logger): 用于记录量化过程信息的日志记录器。
+    """
+
     def __init__(self, qconfig: QConfig, debug: bool = False):
+        """
+        初始化 Quantizer 实例。
+
+        Args:
+            qconfig (QConfig): 一个 QConfig 实例，定义了用于权重和激活的
+                               量化器/观察器模块的工厂函数。此配置将指导
+                               `prepare` 方法中插入哪些类型的量化节点。
+                               `qconfig.activation` 和 `qconfig.weight`
+                               必须是可调用的工厂函数（例如类）或 None。
+            debug (bool, optional): 如果为 True，将启用详细的调试日志记录，
+                                    包括每个节点的处理、插入决策和图的中间状态。
+                                    默认为 False，只记录关键信息和阶段转换。
+
+        Raises:
+            ValueError: 如果提供的 `qconfig` 不是 `QConfig` 的实例。
+            TypeError: 如果 `qconfig.activation` 或 `qconfig.weight`
+                       不是可调用的工厂函数或 None。
+
+        主要作用：
+        - 验证输入的 `qconfig` 是否有效。
+        - 存储 `qconfig` 和 `debug` 标志。
+        - 初始化用于生成唯一量化模块名称的内部计数器。
+        - 获取并配置模块级别的日志记录器，根据 `debug` 标志设置日志级别。
+        - 记录一条初始化消息，指明是在调试模式还是标准模式下运行。
+        """
         if not isinstance(qconfig, QConfig):
             raise ValueError("qconfig 必须是 QConfig 的实例")
         if qconfig.activation is not None and not callable(qconfig.activation):
