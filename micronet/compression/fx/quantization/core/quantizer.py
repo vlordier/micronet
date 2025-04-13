@@ -1,35 +1,25 @@
 # quantization_framework/quant_core/quantizer.py
+import copy  # 确保导入 copy
+
 import torch.nn as nn
 import torch.fx as fx
 from torch.fx.graph_module import GraphModule
-import sys  # 用于检查 TTY
 
-# from .qconfig import QConfig # Keep if QConfig is defined locally
-# 假设这些在 qconfig.py 中定义
 from .qconfig import QConfig
-
 from .graph_utils import (
     is_quantizable_weight_module,
     is_quantizable_activation_module,
     is_quantizable_activation_function,
+    is_quantizable_activation_method,  # <--- 导入新增的函数
+    _colorize,
+    COLOR_DEBUG,
+    COLOR_INFO,
+    COLOR_WARN,
+    COLOR_SUCCESS,
+    COLOR_ERROR,
+    COLOR_BOLD,
+    COLOR_RESET,  # <--- 导入颜色工具
 )
-
-# --- ANSI 颜色代码 ---
-# 检查是否在 TTY 环境中，以避免在不支持颜色的地方（如文件重定向）输出颜色代码
-_IS_TTY = sys.stdout.isatty()
-
-COLOR_DEBUG = "\033[96m"  # 青色 (Cyan) for debug steps
-COLOR_INFO = "\033[94m"  # 蓝色 (Blue) for general info
-COLOR_WARN = "\033[93m"  # 黄色 (Yellow) for warnings
-COLOR_SUCCESS = "\033[92m"  # 绿色 (Green) for success
-COLOR_ERROR = "\033[91m"  # 红色 (Red) for errors
-COLOR_BOLD = "\033[1m"
-COLOR_RESET = "\033[0m"  # 重置颜色
-
-
-def _colorize(text: str, color_code: str) -> str:
-    """如果环境支持，则为文本添加颜色"""
-    return f"{color_code}{text}{COLOR_RESET}" if _IS_TTY else text
 
 
 class Quantizer:
@@ -77,8 +67,10 @@ class Quantizer:
             model.eval()  # 追踪前设置为 eval 模式更稳定
             tracer = fx.Tracer()
             graph = tracer.trace(model)
-            # 创建 GraphModule 时使用原始模型，以保留模块引用
-            traced_model = GraphModule(model, graph)
+            # 创建 GraphModule 时使用原始模型的深拷贝，以隔离修改
+            model_copy = copy.deepcopy(model)
+            traced_model = GraphModule(model_copy, graph)
+
             if self.debug:
                 print(_colorize("模型成功追踪！", COLOR_SUCCESS))
             # --- DEBUG: 打印初始图 ---
@@ -93,7 +85,7 @@ class Quantizer:
             raise e
 
         graph = traced_model.graph
-        # 使用 GraphModule 的 named_modules 获取正确的模块字典
+        # 使用 traced_model 获取模块字典
         modules = dict(traced_model.named_modules())
         self._insertion_point_counter = 0  # Reset counter for this preparation
 
@@ -130,17 +122,20 @@ class Quantizer:
 
                 target_module = modules.get(node.target)
 
+                # 检查是否需要量化权重
                 if (
                     target_module
                     and is_quantizable_weight_module(target_module)
-                    and self.qconfig.weight
-                    and hasattr(target_module, "weight")
+                    and self.qconfig.weight  # 检查 QConfig 是否配置了权重处理
+                    and hasattr(target_module, "weight")  # 检查模块是否有 weight 属性
                 ):
+                    # (权重占位符插入逻辑 - 保持不变)
                     weight_quant_module_cls = self.qconfig.weight
                     weight_quant_instance = weight_quant_module_cls()
                     quant_module_name = self._get_unique_module_name(
                         f"weight_quant_{str(node.target).replace('.', '_')}"
                     )
+                    # 在 traced_model (副本) 上添加模块
                     traced_model.add_module(quant_module_name, weight_quant_instance)
 
                     weight_attr_target = f"{node.target}.weight"
@@ -172,6 +167,7 @@ class Quantizer:
                                 COLOR_DEBUG,
                             )
                         )
+                # (打印跳过权重的原因 - 保持不变)
                 elif (
                     self.debug
                     and target_module
@@ -196,8 +192,9 @@ class Quantizer:
             should_quantize_output = False
             output_prefix = ""
             reason = ""  # For debug logging
-            is_output_from_quant_module = False
+            is_output_from_quant_module = False  # 标记输出是否已来自量化器
 
+            # 检查当前节点是否是量化器模块的调用
             if node.op == "call_module" and node.target in modules:
                 current_module = modules.get(node.target)
                 # 检查是否是 QConfig 中定义的激活或权重观察者/伪量化器类型
@@ -218,9 +215,8 @@ class Quantizer:
                             )
                         )
 
-            if (
-                not is_output_from_quant_module and self.qconfig.activation
-            ):  # Only proceed if activation quant is configured
+            # 仅当输出不是来自量化器且 QConfig 配置了激活量化时才继续
+            if not is_output_from_quant_module and self.qconfig.activation:
                 if node.op == "call_module":
                     if node.target in modules:
                         target_module = modules.get(node.target)
@@ -238,7 +234,16 @@ class Quantizer:
                         func_name = getattr(node.target, "__name__", str(node.target))
                         output_prefix = f"act_quant_after_{func_name}"
                         reason = f"来自可量化函数 '{func_name}'"
+                # --- 新增：处理 call_method ---
+                elif node.op == "call_method":
+                    method_name = str(node.target)  # 获取方法名
+                    if is_quantizable_activation_method(method_name):  # 检查方法名
+                        should_quantize_output = True
+                        output_prefix = f"act_quant_after_method_{method_name}"
+                        reason = f"来自可量化方法调用 '{method_name}'"
+                # -----------------------------
                 elif node.op == "placeholder":
+                    # (placeholder 的激活量化逻辑 - 保持不变)
                     already_quantized_by_user = False
                     for user in node.users:
                         if user.op == "call_module" and user.target in modules:
@@ -260,7 +265,9 @@ class Quantizer:
                         output_prefix = f"act_quant_input_{node.target}"
                         reason = f"来自输入 placeholder '{node.target}'"
 
+            # --- 插入激活占位符的具体逻辑 (保持不变) ---
             if should_quantize_output and self.qconfig.activation:
+                # 再次检查是否已被后续节点量化
                 is_already_quantized_by_user = False
                 for user in node.users:
                     if user.op == "call_module" and user.target in modules:
@@ -276,8 +283,9 @@ class Quantizer:
                                 )
                             break
                 if is_already_quantized_by_user:
-                    continue
+                    continue  # 跳过插入
 
+                # 实例化并添加模块
                 act_quant_module_cls = self.qconfig.activation
                 act_quant_instance = act_quant_module_cls()
                 quant_module_name = self._get_unique_module_name(output_prefix)
@@ -292,11 +300,19 @@ class Quantizer:
                         )
                     )
 
+                # 插入调用节点并更新用户
                 with graph.inserting_after(node):
                     inserted_node = graph.call_module(quant_module_name, args=(node,))
 
-                node.replace_all_uses_with(inserted_node)
-                inserted_node.args = (node,)  # Crucial step
+                # --- 安全地更新用户 ---
+                users_to_update = list(node.users.keys())
+                for user_node in users_to_update:
+                    if user_node != inserted_node:  # 避免用自身替换
+                        user_node.replace_input_with(node, inserted_node)
+                # --------------------
+
+                # 确保插入的节点参数正确
+                inserted_node.args = (node,)
 
                 if self.debug:
                     print(
@@ -306,6 +322,7 @@ class Quantizer:
                         )
                     )
 
+            # (Debug: 打印跳过激活的原因 - 保持不变)
             elif (
                 self.debug
                 and not should_quantize_output
@@ -317,17 +334,16 @@ class Quantizer:
                             f"  [跳过激活] QConfig 未配置激活占位符。", COLOR_INFO
                         )
                     )
-                else:
-                    # This condition might be too noisy if printed for every non-quantizable node.
-                    # Consider printing only if node *could* have been quantized but wasn't for other reasons.
-                    pass
-                    # print(_colorize(f"  节点 '{node.name}' (op={node.op}) 未被识别为需要激活量化的点。", COLOR_DEBUG))
+                # 可以根据需要添加更详细的跳过原因
+                # else:
+                #    print(...)
 
         # --- 清理和重新编译 ---
         if self.debug:
             print(_colorize("\nLinting graph...", COLOR_INFO))
         graph.lint()  # Check graph validity
-        prepared_model = GraphModule(traced_model, graph)  # Recompile
+        # 使用修改后的 traced_model (包含添加的模块) 和 graph 创建最终模型
+        prepared_model = GraphModule(traced_model, graph)
 
         if self.debug:
             print(_colorize("\n--- 修改后的计算图 (Prepare 阶段) ---", COLOR_INFO))
@@ -337,7 +353,7 @@ class Quantizer:
         print(_colorize("模型准备完成，已插入占位符。", COLOR_SUCCESS))
         return prepared_model
 
-    # --- convert 方法 (添加 debug 打印) ---
+    # --- convert 方法 (保持不变) ---
     def convert(self, prepared_model: GraphModule) -> GraphModule:
         """
         转换准备好的模型，将占位符替换为实际的量化操作或模块 (简化版：仅移除)。
@@ -369,7 +385,6 @@ class Quantizer:
         for node in graph.nodes:
             if node.op == "call_module":
                 if node.target not in modules:
-                    # This shouldn't happen if prepare worked correctly, but good for robustness
                     if self.debug:
                         print(
                             _colorize(
@@ -388,10 +403,8 @@ class Quantizer:
                 )
 
                 if is_act_placeholder:
-                    if node not in replacements:  # Check before adding
-                        # Key insight for removal: replace uses of the observer node with its input node
+                    if node not in replacements:
                         replacements[node] = node.args[0]
-                    # Mark observer node itself for removal later
                     nodes_to_remove.append(node)
                     if self.debug:
                         print(
@@ -403,13 +416,9 @@ class Quantizer:
                         )
 
                 elif is_wt_placeholder:
-                    # Weight observers are side effects, they don't process main data flow.
-                    # Remove the observer call itself.
                     nodes_to_remove.append(node)
-                    # Also remove the get_attr node *if* it's only used by this observer.
                     if len(node.args) == 1 and node.args[0].op == "get_attr":
                         get_attr_node = node.args[0]
-                        # Check if get_attr node has only one user, which is this observer node
                         if (
                             len(get_attr_node.users) == 1
                             and list(get_attr_node.users.keys())[0] == node
@@ -451,7 +460,20 @@ class Quantizer:
                         COLOR_DEBUG,
                     )
                 )
-            old_node.replace_all_uses_with(new_node)
+            # --- 安全地更新用户 ---
+            users_to_update = list(old_node.users.keys())
+            for user_node in users_to_update:
+                # 确保 new_node 不是 None 或有其他问题
+                if new_node is not None:
+                    user_node.replace_input_with(old_node, new_node)
+                elif self.debug:
+                    print(
+                        _colorize(
+                            f"  [警告] 尝试用 None 替换节点 '{old_node.name}' 的用户 '{user_node.name}'，跳过此替换。",
+                            COLOR_WARN,
+                        )
+                    )
+            # --------------------
 
         # Remove marked nodes (in reverse order to handle dependencies)
         if self.debug and nodes_to_remove:
@@ -464,15 +486,21 @@ class Quantizer:
                         COLOR_DEBUG,
                     )
                 )
-            graph.erase_node(node)
+            try:
+                graph.erase_node(node)
+            except Exception as e:
+                if self.debug:
+                    print(
+                        _colorize(f"  移除节点 '{node.name}' 时出错: {e}", COLOR_ERROR)
+                    )
 
         # --- 清理和重新编译 ---
         if self.debug:
             print(_colorize("\nLinting graph after conversion...", COLOR_INFO))
         graph.lint()
-        converted_model = GraphModule(
-            prepared_model, graph
-        )  # Recompile from the modified graph
+        # 使用 prepared_model 作为 root，因为它包含了原始模块的结构
+        # GraphModule 会使用更新后的 graph
+        converted_model = GraphModule(prepared_model, graph)
 
         if self.debug:
             print(_colorize("\n--- 最终计算图 (Convert 阶段) ---", COLOR_INFO))
