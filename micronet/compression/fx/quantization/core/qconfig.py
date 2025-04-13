@@ -1,6 +1,3 @@
-# quantization_framework/quant_core/qconfig.py
-
-import torch  # <--- 添加：导入 torch 核心库
 import torch.nn as nn
 from dataclasses import dataclass
 from typing import (
@@ -9,103 +6,10 @@ from typing import (
     Dict,
     Type,
     Union,
-    Tuple,
-)  # <--- 添加：从 typing 导入 Tuple
+)
 
-# --- 占位符模块 ---
-# 这些模块在 prepare 阶段被插入，作为未来 Observer 或 FakeQuant 的占位符
-# 它们本身在 prepare 阶段不做任何计算，只是标记位置
-
-
-class PlaceholderObserver(nn.Module):
-    """
-    一个简单的占位符模块，标记将来要插入 Observer 的位置。
-    在 PTQ 的 prepare 阶段使用。
-    """
-
-    def __init__(self):
-        """
-        初始化占位符 Observer。
-        实际的 Observer 会在这里初始化统计量 buffer。
-        """
-        super().__init__()
-        # 实际的 Observer 会在这里初始化统计量 buffer，例如 min_val, max_val
-        # 使用 torch.tensor 需要导入 torch
-        self.register_buffer("min_val", torch.tensor(float("inf")))
-        self.register_buffer("max_val", torch.tensor(float("-inf")))  # 示例 buffer
-        # print(f"  [PlaceholderObserver {id(self)}] 初始化") # 暂时注释掉打印
-
-    # forward 方法的类型提示需要 torch.Tensor
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        在 forward 传递中“观察”输入张量。
-        实际 Observer 会在这里收集统计数据（例如 min/max）。
-        此占位符仅返回输入。
-        """
-        # 实际观察逻辑:
-        # if x.is_floating_point():
-        #     self.min_val = torch.min(x.min(), self.min_val) # 需要 torch.min
-        #     self.max_val = torch.max(x.max(), self.max_val) # 需要 torch.max
-        # print(f"  [PlaceholderObserver {id(self)}] 观察到输入形状: {x.shape}")
-        return x
-
-    # calculate_qparams 的返回类型提示需要 Tuple 和 torch.Tensor
-    def calculate_qparams(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        计算量化参数（scale, zero_point）。
-        实际 Observer 会基于收集的统计数据计算这些参数。
-        此占位符返回默认值或引发错误。
-        """
-        # 实际计算逻辑会在这里
-        # print(f"  [PlaceholderObserver {id(self)}] 计算量化参数 (占位符)")
-        # 返回示例值，实际应基于 min_val, max_val 计算
-        scale = torch.tensor(1.0)  # 需要 torch.tensor
-        zero_point = torch.tensor(0)  # 需要 torch.tensor
-        return scale, zero_point
-
-    def __repr__(self) -> str:
-        """返回模块的字符串表示形式。"""
-        return f"{self.__class__.__name__}()"
-
-
-class PlaceholderFakeQuant(nn.Module):
-    """
-    一个简单的占位符模块，标记将来要插入 FakeQuantize 模块的位置。
-    在 QAT 的 prepare 阶段使用。
-    """
-
-    def __init__(self):
-        """
-        初始化占位符 FakeQuant。
-        实际的 FakeQuant 会在这里初始化 scale/zero_point 参数，
-        并且这些参数可能是可学习的。
-        """
-        super().__init__()
-        # 实际 FakeQuant 的参数
-        # nn.Parameter 来自 torch.nn
-        # torch.tensor 来自 torch
-        self.scale = nn.Parameter(torch.tensor(1.0))
-        self.zero_point = nn.Parameter(
-            torch.tensor(0.0)
-        )  # QAT 中 zero_point 通常也是浮点参数
-        # print(f"  [PlaceholderFakeQuant {id(self)}] 初始化") # 暂时注释掉打印
-
-    # forward 方法的类型提示需要 torch.Tensor
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        在 forward 传递中执行“伪量化”。
-        实际 FakeQuant 会在这里执行模拟量化操作 (quantize-dequantize)。
-        此占位符仅返回输入。
-        """
-        # 实际伪量化逻辑:
-        # x_q = torch.quantize_per_tensor(x, self.scale, self.zero_point, torch.quint8) # 需要 torch
-        # x_dq = x_q.dequantize()
-        # print(f"  [PlaceholderFakeQuant {id(self)}] 应用伪量化 (占位符)")
-        return x  # 返回原始输入
-
-    def __repr__(self) -> str:
-        """返回模块的字符串表示形式。"""
-        return f"{self.__class__.__name__}()"
+from .observer import PlaceholderObserver
+from .fake_quant import PlaceholderFakeQuant
 
 
 # 类型提示别名
@@ -281,7 +185,7 @@ class QConfigMapping:
         return self._global_qconfig
 
 
-# --- 实用函数 (可选) ---
+# --- 实用函数 ---
 def get_default_ptq_qconfig() -> QConfig:
     """返回默认的 PTQ QConfig (使用占位符 Observer)。"""
     return default_placeholder_ptq_qconfig

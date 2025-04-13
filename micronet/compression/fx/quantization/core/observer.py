@@ -1,27 +1,58 @@
-# quantization_framework/quant_core/observer.py
+from typing import Tuple  # Python 3.9 之前
+
+import torch
 import torch.nn as nn
 
 
 class PlaceholderObserver(nn.Module):
     """
-    一个简单的占位符 Observer，用于标记需要观察激活或权重的位置。
-    在 PTQ 校准阶段，它将被替换或填充统计数据。
+    一个简单的占位符模块，标记将来要插入 Observer 的位置。
+    在 PTQ 的 prepare 阶段使用。
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self):
+        """
+        初始化占位符 Observer。
+        实际的 Observer 会在这里初始化统计量 buffer。
+        """
         super().__init__()
-        # 这里可以存储一些元数据，比如数据类型、量化方案等，但现在保持简单
-        self.placeholder_args = args
-        self.placeholder_kwargs = kwargs
+        # 实际的 Observer 会在这里初始化统计量 buffer，例如 min_val, max_val
+        # 使用 torch.tensor 需要导入 torch
+        self.register_buffer("min_val", torch.tensor(float("inf")))
+        self.register_buffer("max_val", torch.tensor(float("-inf")))  # 示例 buffer
+        # print(f"  [PlaceholderObserver {id(self)}] 初始化") # 暂时注释掉打印
 
-    def forward(self, x):
-        # 在准备阶段，它只是一个标识符，不做任何事情
+    # forward 方法的类型提示需要 torch.Tensor
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        在 forward 传递中“观察”输入张量。
+        实际 Observer 会在这里收集统计数据（例如 min/max）。
+        此占位符仅返回输入。
+        """
+        # 实际观察逻辑:
+        # if x.is_floating_point():
+        #     self.min_val = torch.min(x.min(), self.min_val) # 需要 torch.min
+        #     self.max_val = torch.max(x.max(), self.max_val) # 需要 torch.max
+        # print(f"  [PlaceholderObserver {id(self)}] 观察到输入形状: {x.shape}")
         return x
 
-    def __repr__(self):
-        return (
-            f"PlaceholderObserver({self.placeholder_args}, {self.placeholder_kwargs})"
-        )
+    # calculate_qparams 的返回类型提示需要 Tuple 和 torch.Tensor
+    def calculate_qparams(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        计算量化参数（scale, zero_point）。
+        实际 Observer 会基于收集的统计数据计算这些参数。
+        此占位符返回默认值或引发错误。
+        """
+        # 实际计算逻辑会在这里
+        # print(f"  [PlaceholderObserver {id(self)}] 计算量化参数 (占位符)")
+        # 返回示例值，实际应基于 min_val, max_val 计算
+        scale = torch.tensor(1.0)  # 需要 torch.tensor
+        zero_point = torch.tensor(0)  # 需要 torch.tensor
+        return scale, zero_point
+
+    def __repr__(self) -> str:
+        """返回模块的字符串表示形式。"""
+        return f"{self.__class__.__name__}()"
 
 
 # 可以根据需要定义更具体的占位符，比如 MinMaxObserverPlaceholder 等
