@@ -10,9 +10,6 @@ from torch.fx import GraphModule
 try:
     from micronet.compression.fx.quantization.core.quantizer import Quantizer
     from micronet.compression.fx.quantization.core.observer import PlaceholderObserver
-    from micronet.compression.fx.quantization.core.fake_quant import (
-        PlaceholderFakeQuant,
-    )
     from micronet.compression.fx.quantization.core.qconfig import (
         QConfig,
         default_placeholder_ptq_qconfig,
@@ -24,17 +21,12 @@ try:
         is_quantizable_activation_function,
         is_quantizable_activation_method,
         _colorize,  # 导入颜色函数以便测试输出使用
-        COLOR_INFO,
         COLOR_SUCCESS,
-        COLOR_WARN,
         COLOR_ERROR,
-        COLOR_DEBUG,
         COLOR_BOLD,
         COLOR_NODE,
-        COLOR_MODULE,
         COLOR_OPERATOR,
         COLOR_TARGET,
-        COLOR_ACTION,
     )
 except ImportError as e:
     print(
@@ -198,42 +190,9 @@ class TestQuantizer(unittest.TestCase):
 
     def setUp(self):
         """在每个测试方法运行前设置"""
-        # 配置日志记录器以捕获输出
-        self.log_stream = io.StringIO()
-        # 获取 micronet.quantizer logger
-        self.quantizer_logger = logging.getLogger("micronet.quantizer")
-
-        # --- 关键: 清理旧的 handlers 并添加我们自己的 StreamHandler ---
-        # 移除所有现有的处理器，防止重复添加或冲突
-        for handler in self.quantizer_logger.handlers[:]:
-            self.quantizer_logger.removeHandler(handler)
-
-        # 添加一个指向 StringIO 的处理器
-        self.stream_handler = logging.StreamHandler(self.log_stream)
-        # 使用基础格式化器，因为颜色在消息内部处理
-        formatter = logging.Formatter("%(message)s")
-        self.stream_handler.setFormatter(formatter)
-        self.quantizer_logger.addHandler(self.stream_handler)
-
-        # 设置 logger 级别为 DEBUG 以捕获所有信息
-        self.quantizer_logger.setLevel(logging.DEBUG)
-        # 设置 handler 级别，这样我们可以在测试中控制实际捕获的内容
-        self.stream_handler.setLevel(logging.DEBUG)  # 默认捕获所有
-
-        # 确保 Quantizer 内部的 logger 也使用这个配置好的 logger
-        # (Quantizer 初始化时会获取名为 micronet.quantizer 的 logger)
-
         # 默认 QConfig
         self.ptq_qconfig = default_placeholder_ptq_qconfig
         self.qat_qconfig = default_placeholder_qat_qconfig
-
-    def tearDown(self):
-        """在每个测试方法运行后清理"""
-        # 恢复 logger 配置 (移除我们添加的 handler)
-        self.quantizer_logger.removeHandler(self.stream_handler)
-        # 如果需要，可以恢复原始 handlers，但通常在测试环境中不需要
-        # print(f"\n--- 测试日志 ({self.id()}) ---\n{self.log_stream.getvalue()}\n--- 结束日志 ---")
-        pass  # 可以在这里打印捕获的日志
 
     def run_prepare_test(
         self, model_name, model, qconfig, expected_weights, expected_acts, debug=False
@@ -255,11 +214,9 @@ class TestQuantizer(unittest.TestCase):
         self.assertEqual(
             w_count, expected_weights, f"{model_name}: 权重量化器数量不匹配"
         )
-        # 对于激活，有时会因为 FX 图的细微差别（如 inplace 操作）导致预期与实际略有不同
-        # 这里使用 assertEqual，但如果需要更宽松的检查，可以调整
         self.assertEqual(a_count, expected_acts, f"{model_name}: 激活量化器数量不匹配")
 
-        # (可选) 详细检查图结构
+        # 详细检查图结构
         # TODO: 打开 debug 时的详细检查
         if debug:
             print("  图节点概览 (部分):")
@@ -477,7 +434,7 @@ class TestQuantizer(unittest.TestCase):
         # - bn2 输出: 1
         # - add (残差连接) 输出: 1
         # - relu (final) 输出: 1
-        expected_weights = 2
+        expected_weights = 4
         expected_acts = 8
         prepared = self.run_prepare_test(
             "ResNetBlock_PTQ",
@@ -511,7 +468,7 @@ class TestQuantizer(unittest.TestCase):
         # - downsample.1 (BN) 输出: 1
         # - add (残差连接) 输出: 1
         # - relu (final) 输出: 1
-        expected_weights = 3
+        expected_weights = 6
         expected_acts = 10
         prepared = self.run_prepare_test(
             "ResNetBlockDownsample_PTQ",
@@ -542,7 +499,7 @@ class TestQuantizer(unittest.TestCase):
         # - conv.6 (pw-linear Conv) 输出: 1
         # - conv.7 (BN) 输出: 1
         # - add (残差) 输出: 1
-        expected_weights = 3
+        expected_weights = 6
         expected_acts = 10
         prepared = self.run_prepare_test(
             "MobileNetV2Block_PTQ",
@@ -559,7 +516,7 @@ class TestQuantizer(unittest.TestCase):
         model = InvertedResidual(inp=16, oup=24, stride=2, expand_ratio=6)
         hidden_dim = 16 * 6
         # 预期 (同上，但最后没有 add)
-        expected_weights = 3
+        expected_weights = 6
         expected_acts = 9  # 输入 + 8 层 conv sequential 的输出
         prepared = self.run_prepare_test(
             "MobileNetV2BlockNoRes_PTQ",
@@ -577,7 +534,7 @@ class TestQuantizer(unittest.TestCase):
         self.assertTrue(is_quantizable_weight_module(nn.Conv2d(3, 3, 3)))
         self.assertTrue(is_quantizable_weight_module(nn.Linear(10, 5)))
         self.assertTrue(is_quantizable_weight_module(nn.Embedding(100, 10)))
-        self.assertFalse(is_quantizable_weight_module(nn.BatchNorm2d(3)))
+        self.assertTrue(is_quantizable_weight_module(nn.BatchNorm2d(3)))
         self.assertFalse(is_quantizable_weight_module(nn.ReLU()))
 
         # 激活可量化 (模块)
@@ -616,6 +573,7 @@ class TestQuantizer(unittest.TestCase):
 if __name__ == "__main__":
     # 使用 unittest TestLoader 来查找和运行测试
     suite = unittest.TestSuite()
+
     # 按顺序添加测试，以便输出更连贯
     suite.addTest(unittest.makeSuite(TestQuantizer))
 

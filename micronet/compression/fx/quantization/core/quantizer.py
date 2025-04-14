@@ -8,6 +8,7 @@ from torch.fx.graph_module import GraphModule
 
 from .qconfig import QConfig
 from .graph_utils import (
+    fuse_conv_linear_bn_fx,
     is_quantizable_weight_module,
     is_quantizable_activation_module,
     is_quantizable_activation_function,
@@ -28,77 +29,55 @@ from .graph_utils import (
     COLOR_REASON,
     COLOR_TARGET,
     COLOR_INPUT,
+    graph_utils_logger,  # 导入 graph_utils 的日志记录器以便统一控制级别
 )
 
 # --- 配置此模块的日志记录器 ---
-# 使用特定的名称以避免冲突
-logger = logging.getLogger("micronet.quantizer")
-# 防止 Quantizer 被多次实例化时出现重复的处理器
+logger = logging.getLogger("micronet.fx.quantizer")
 if not logger.hasHandlers():
-    # 默认处理器：StreamHandler 输出到控制台 (stderr)
-    handler = logging.StreamHandler(sys.stderr)  # 日志通常使用 stderr
-    # 基本格式化器，因为着色在消息字符串内部处理
+    handler = logging.StreamHandler(sys.stderr)
     formatter = logging.Formatter("%(message)s")
     handler.setFormatter(formatter)
     logger.addHandler(handler)
-    # 将日志记录器的基本级别设置为 DEBUG 以捕获所有信息
     logger.setLevel(logging.DEBUG)
-    # --- 关键：如果根日志记录器在别处配置，避免将消息传播到根日志记录器 ---
-    # logger.propagate = False # 如果您有全局日志设置并且想要隔离此日志记录器，请取消注释此行
+    logger.propagate = False
 
 
 class Quantizer:
     """
-    管理使用 torch.fx 对 PyTorch 模型进行量化准备过程的核心类。
+    管理使用 torch.fx 对 PyTorch 模型进行量化准备和优化的核心类。
 
     此类负责接收一个原始的 nn.Module 模型和一个 QConfig 量化配置对象。
-    它的主要功能是通过符号追踪（Symbolic Tracing）获取模型的计算图（FX Graph），
-    然后根据 QConfig 中的设定，在图中的适当位置（例如，特定模块的权重之前，
-    或特定操作/模块的输出之后）插入量化节点（通常是 Observer 或 FakeQuantize 模块）。
+    它的主要功能包括：
+    1. (可选) 模型融合：自动检测并融合常见的层组合（如 Conv-BN, Linear-BN）。
+    2. 量化准备：通过符号追踪获取模型的计算图（FX Graph），
+       根据 QConfig 中的设定，在图中的适当位置插入量化节点（Observer/FakeQuant）。
 
     主要工作流程集中在 `prepare` 方法中，该方法执行以下操作：
     1. 使用 `torch.fx` 追踪原始模型，生成计算图。
-    2. 遍历计算图中的节点。
-    3. 根据节点的类型（调用模块、函数、方法、占位符）和 `QConfig` 的配置，
-       判断是否需要插入权重量化器或激活量化器。
-    4. 在图中插入相应的量化模块（来自 `QConfig`）。
-    5. 返回一个修改后的、包含量化节点的 `torch.fx.GraphModule`。
-
-    这个准备好的模型随后可以用于：
-    - 后训练量化（PTQ）的校准（Calibration）阶段：运行数据通过模型以收集统计信息。
-    - 量化感知训练（QAT）：在训练过程中模拟量化效应。
+    2. (可选) 遍历图，自动识别可融合的 Conv/Linear -> BatchNorm 模式。
+    3. (可选) 调用 `fuse_conv_linear_bn_fx` 函数 (在 graph_utils.py 中) 应用这些融合。
+    4. 更新图和模块字典以反映融合后的结构。
+    5. 遍历（可能已融合的）计算图中的节点。
+    6. 根据节点的类型和 `QConfig`，插入权重和激活量化器。
+    7. 返回一个修改后的、包含融合层和量化节点的 `torch.fx.GraphModule`。
 
     Attributes:
-        qconfig (QConfig): 存储量化配置，指定用于权重和激活的量化器模块工厂。
+        qconfig (QConfig): 存储量化配置。
         debug (bool): 控制是否启用详细的调试日志输出。
-        logger (logging.Logger): 用于记录量化过程信息的日志记录器。
+        logger (logging.Logger): 用于记录信息的日志记录器。
+        fuse_bn (bool): 控制是否执行 Conv/Linear-BN 融合。
     """
 
-    def __init__(self, qconfig: QConfig, debug: bool = False):
+    def __init__(self, qconfig: QConfig, debug: bool = False, fuse_bn: bool = False):
         """
         初始化 Quantizer 实例。
 
         Args:
-            qconfig (QConfig): 一个 QConfig 实例，定义了用于权重和激活的
-                               量化器/观察器模块的工厂函数。此配置将指导
-                               `prepare` 方法中插入哪些类型的量化节点。
-                               `qconfig.activation` 和 `qconfig.weight`
-                               必须是可调用的工厂函数（例如类）或 None。
-            debug (bool, optional): 如果为 True，将启用详细的调试日志记录，
-                                    包括每个节点的处理、插入决策和图的中间状态。
-                                    默认为 False，只记录关键信息和阶段转换。
-
-        Raises:
-            ValueError: 如果提供的 `qconfig` 不是 `QConfig` 的实例。
-            TypeError: 如果 `qconfig.activation` 或 `qconfig.weight`
-                       不是可调用的工厂函数或 None。
-
-        主要作用：
-        - 验证输入的 `qconfig` 是否有效。
-        - 存储 `qconfig` 和 `debug` 标志。
-        - 初始化用于生成唯一量化模块名称的内部计数器。
-        - 获取并配置模块级别的日志记录器，根据 `debug` 标志设置日志级别。
-        - 记录一条初始化消息，指明是在调试模式还是标准模式下运行。
+            qconfig (QConfig): QConfig 实例。
+            debug (bool, optional): 是否启用调试日志。默认为 False。
+            fuse_bn (bool, optional): 是否在准备阶段自动融合 Conv/Linear-BN 层。
+                                      默认为 True。
         """
         if not isinstance(qconfig, QConfig):
             raise ValueError("qconfig 必须是 QConfig 的实例")
@@ -113,22 +92,33 @@ class Quantizer:
 
         self.qconfig = qconfig
         self.debug = debug
+        self.fuse_bn = fuse_bn
         self._insertion_point_counter = 0
-
-        # --- 使用模块级别的日志记录器 ---
         self.logger = logger
-        # --- 根据 debug 标志设置处理器的级别 ---
-        # 这控制了实际输出到控制台的内容
+        # 设置此模块和 graph_utils 模块的日志级别
+        log_level = logging.DEBUG if self.debug else logging.INFO
         for h in self.logger.handlers:
-            h.setLevel(logging.DEBUG if self.debug else logging.INFO)
+            h.setLevel(log_level)
+        # 也设置 graph_utils 的级别
+        for h in graph_utils_logger.handlers:
+            h.setLevel(log_level)
+        # 确保 graph_utils 的 logger 级别也被设置 (如果 quantizer debug=True, graph_utils 也 debug)
+        graph_utils_logger.setLevel(log_level)
 
-        # 使用 logger.debug 输出初始消息
-        self.logger.debug(
-            _colorize(
-                f"[{'调试模式' if self.debug else '标准模式'}] 量化模型初始化",  # 在非调试模式下也提供信息
-                COLOR_BOLD + COLOR_CYAN,
+        if self.debug:
+            self.logger.debug(
+                _colorize(
+                    f"[{'调试模式'}] Quantizer 初始化 (BN融合: {'启用' if self.fuse_bn else '禁用'})",
+                    COLOR_BOLD + COLOR_CYAN,
+                )
             )
-        )
+        else:
+            self.logger.info(
+                _colorize(
+                    f"[{'标准模式'}] Quantizer 初始化 (BN融合: {'启用' if self.fuse_bn else '禁用'})",
+                    COLOR_BOLD + COLOR_CYAN,
+                )
+            )
 
     def _get_unique_module_name(self, prefix: str) -> str:
         """生成唯一的模块名称以避免冲突"""
@@ -139,12 +129,11 @@ class Quantizer:
     def prepare(self, model: nn.Module) -> GraphModule:
         """
         准备模型以进行量化（PTQ 校准或 QAT 训练）。
-        为激活和权重插入观察器/占位符。
+        包括可选的 BN 融合和插入观察器/占位符。
         """
-        # 使用 logger.info 标记阶段（在两种模式下都可见）
         self.logger.info(
             _colorize(
-                f"\n{'='*20} 量化准备阶段 {'='*20}",
+                f"{'='*20} 量化准备阶段 {'='*20}",
                 COLOR_PHASE,
             )
         )
@@ -153,252 +142,392 @@ class Quantizer:
         try:
             self.logger.debug(_colorize("--> [步骤 1] 追踪模型...", COLOR_INFO))
             original_training_state = model.training
-            model.eval()
+            model.eval()  # 追踪和融合都需要 eval 模式
+
             tracer = fx.Tracer()
             graph = tracer.trace(model)
+            # 创建副本进行修改，不影响原始模型
             model_copy = copy.deepcopy(model)
-            traced_model = GraphModule(model_copy, graph)
+            # 将模型及其图包装在 GraphModule 中
+            # 注意：此时 model_copy 仍处于 eval 模式
+            prepared_model = GraphModule(model_copy, graph)
 
-            # 使用 logger.info 标记主要成功（在两种模式下都可见）
             self.logger.info(_colorize("[成功] 模型追踪完成！", COLOR_SUCCESS))
             if self.debug:
                 self.logger.debug(
-                    _colorize("\n--- 初始 FX 图 ---", COLOR_BOLD + COLOR_INFO)
+                    _colorize("\n--- 初始 FX 图 (追踪后) ---", COLOR_BOLD + COLOR_INFO)
                 )
-                # 重定向 print_tabular 的输出（它输出到 stdout）- 不太理想但必要
-                # 或者，如果需要，捕获它并记录下来，但直接打印对于调试通常没问题
-                # 目前，将 print_tabular 保留在调试检查内
                 graph.print_tabular()
                 self.logger.debug(
                     _colorize("--- (结束初始图) ---\n", COLOR_BOLD + COLOR_INFO)
                 )
-            model.train(original_training_state)
+            # 保持 eval 模式进入融合步骤
+
         except Exception as e:
-            # 使用 logger.exception 记录错误以自动包含回溯信息
+            model.train(original_training_state)  # 出错时恢复状态
             self.logger.exception(_colorize(f"[错误] 模型追踪失败: {e}", COLOR_ERROR))
             raise RuntimeError(f"模型追踪失败: {e}") from e
 
-        graph = traced_model.graph
-        modules = dict(traced_model.named_modules())
-        self._insertion_point_counter = 0
+        graph = prepared_model.graph
+        modules = dict(prepared_model.named_modules())
 
-        nodes_to_process = list(graph.nodes)
+        # --- （可选）BN 融合 ---
+        modules_to_fuse = []  # 重置，以防 prepare 被多次调用
+        fusion_executed = False  # 标记是否实际执行了融合调用
+        if self.fuse_bn:
+            self.logger.info(
+                _colorize(
+                    f"{'='*20} BN 融合 {'='*20}",
+                    COLOR_PHASE,
+                )
+            )
+            try:
+                graph = prepared_model.graph
+                modules = dict(prepared_model.named_modules())  # 获取当前模型副本的模块
+
+                supported_convs = (nn.Conv1d, nn.Conv2d, nn.Conv3d)
+                supported_linears = (nn.Linear,)
+                supported_bns = (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)
+
+                self.logger.debug(
+                    _colorize("--> 搜索 Conv/Linear -> BN 模式...", COLOR_INFO)
+                )
+                for node in graph.nodes:
+                    if node.op == "call_module" and isinstance(
+                        modules.get(str(node.target)),
+                        (supported_convs + supported_linears),
+                    ):
+                        conv_or_linear_node = node
+                        # 检查用户是否 **唯一** 且为 BN
+                        if len(conv_or_linear_node.users) == 1:
+                            user_node = next(iter(conv_or_linear_node.users))
+                            if user_node.op == "call_module" and isinstance(
+                                modules.get(str(user_node.target)), supported_bns
+                            ):
+                                bn_node = user_node
+                                bn_module = modules.get(str(bn_node.target))
+                                # 确保 BN 模块有运行统计数据 (在 eval 模式下通常是有的)
+                                if (
+                                    hasattr(bn_module, "running_mean")
+                                    and hasattr(bn_module, "running_var")
+                                    and bn_module.running_mean is not None
+                                    and bn_module.running_var is not None
+                                ):
+                                    module_pair = [
+                                        str(conv_or_linear_node.target),
+                                        str(bn_node.target),
+                                    ]
+                                    modules_to_fuse.append(module_pair)
+                                    self.logger.debug(
+                                        _colorize(
+                                            f"  发现可融合对: {_colorize(module_pair[0], COLOR_MODULE)} -> {_colorize(module_pair[1], COLOR_MODULE)}",
+                                            COLOR_DEBUG,
+                                        )
+                                    )
+                                else:
+                                    self.logger.debug(
+                                        _colorize(
+                                            f"  跳过融合检测: BN 模块 {_colorize(str(bn_node.target), COLOR_MODULE)} 缺少运行统计数据。确保模型已训练并在 eval() 模式。",
+                                            COLOR_WARN,
+                                        )
+                                    )
+                            # else: # 如果用户不是 BN 模块，则不融合
+                        # else: # 如果有多个用户，则不融合
+
+                if modules_to_fuse:
+                    self.logger.info(
+                        _colorize(
+                            f"找到 {len(modules_to_fuse)} 对 Conv/Linear-BN 可进行融合。调用融合函数...",
+                            COLOR_INFO,
+                        )
+                    )
+                    # --- 执行融合 ---
+                    # 调用 graph_utils.py 中的函数
+                    # 它会直接修改 prepared_model
+                    prepared_model = fuse_conv_linear_bn_fx(
+                        prepared_model, modules_to_fuse
+                    )
+                    fusion_executed = True  # 标记已调用融合
+
+                    # --- 关键：融合函数内部会处理图和模块的修改，并重新编译 ---
+                    # 所以这里只需要更新本地的 graph 和 modules 引用以进行后续处理
+                    graph = prepared_model.graph
+                    modules = dict(
+                        prepared_model.named_modules()
+                    )  # 获取融合后的模块字典
+                    self.logger.info(_colorize("[成功] BN 融合完成！", COLOR_SUCCESS))
+                    if self.debug:
+                        self.logger.debug(
+                            _colorize(
+                                "\n--- FX 图 (BN 融合后) ---", COLOR_BOLD + COLOR_INFO
+                            )
+                        )
+                        # 融合函数内部可能已经 recompile 过，所以图应该是最新的
+                        graph.print_tabular()
+                        self.logger.debug(
+                            _colorize("--- (结束融合图) ---\n", COLOR_BOLD + COLOR_INFO)
+                        )
+                else:
+                    self.logger.info(
+                        _colorize("未找到可融合的 Conv/Linear-BN 对。", COLOR_INFO)
+                    )
+
+            except Exception as e:
+                # 如果融合失败，记录错误但可能继续（取决于策略）
+                model.train(original_training_state)  # 恢复原始模型状态
+                self.logger.exception(
+                    _colorize(f"[错误] BN 融合失败: {e}", COLOR_ERROR)
+                )
+                # 这里选择继续，使用未融合的图
+                # raise RuntimeError(f"BN 融合失败: {e}") from e # 如果希望融合失败阻止后续步骤
+                self.logger.warning(
+                    _colorize(
+                        "BN 融合失败，将继续进行量化器插入（使用追踪后的原始图）。",
+                        COLOR_WARN,
+                    )
+                )
+                # 确保 graph 和 modules 是融合前的状态 (从 prepared_model 获取)
+                graph = prepared_model.graph
+                modules = dict(prepared_model.named_modules())
+                fusion_executed = False  # 融合未成功执行
+
+        # --- 量化器插入 ---
+        # 使用融合（或未融合）后的 graph 和 modules
+        self._insertion_point_counter = 0  # 重置插入计数器
+        nodes_to_process = list(graph.nodes)  # 基于当前图状态获取节点列表
         num_nodes = len(nodes_to_process)
         self.logger.debug(
             _colorize(
-                f"\n--> [步骤 2] 处理 {num_nodes} 个图节点以插入量化器...",
+                f"\n--> [步骤 2] 处理 {num_nodes} 个图节点以插入量化器 (基于{'融合后' if fusion_executed else ('未融合' if self.fuse_bn else '原始')}图)...",
                 COLOR_INFO,
             )
         )
 
         self._printed_no_activation_config = False
 
+        # !!! 节点遍历和量化器插入 !!!
+        # 作用于 `prepared_model` 的当前状态（可能是融合后的）
         for i, node in enumerate(nodes_to_process):
             if self.debug:
-                # 节点处理细节是调试级别
                 op_color = COLOR_OPERATOR
                 target_color = COLOR_OPERATOR
                 target_str = str(node.target)
+                node_type_info = ""  # 用于显示模块类型
                 if node.op == "call_module":
                     op_color = COLOR_MODULE
                     target_color = COLOR_MODULE
-                    target_str = _colorize(target_str, target_color)
+                    # 检查模块是否存在于当前 modules 字典中
+                    if target_str in modules:
+                        target_module = modules[target_str]
+                        node_type_info = (
+                            f" ({type(target_module).__name__})"  # 显示类型
+                        )
+                        target_str = (
+                            _colorize(target_str, target_color) + node_type_info
+                        )
+                    else:
+                        # 这个模块可能已被融合删除
+                        target_str = (
+                            _colorize(target_str, COLOR_WARN) + " (模块可能已融合/移除)"
+                        )
                 elif node.op == "get_attr":
                     target_color = COLOR_TARGET
                     target_str = _colorize(target_str, target_color)
                 elif node.op == "placeholder":
                     target_color = COLOR_INPUT
                     target_str = _colorize(target_str, target_color)
-                else:
+                elif node.op == "output":
+                    target_color = COLOR_TARGET
+                    target_str = _colorize(
+                        "output", target_color
+                    )  # 输出节点没有 target 属性
+                else:  # call_function, call_method
                     target_str = _colorize(target_str, target_color)
 
                 node_info = f"节点 {i+1:>{len(str(num_nodes))}}/{num_nodes}: "
                 node_details = (
                     f"{_colorize(node.name, COLOR_NODE)} "
-                    f"(操作={_colorize(node.op, op_color)}, "
-                    f"目标={target_str})"
+                    f"(op={_colorize(node.op, op_color)}, "
+                    f"target={target_str})"
                 )
                 self.logger.debug(
                     _colorize(f"\n{node_info}{node_details}", COLOR_DEBUG)
                 )
 
-            # --- 动态权重 量化器 插入 ---
+            # --- 权重量化器插入 ---
             if node.op == "call_module":
                 target_key = str(node.target)
+                # 使用更新后的 modules 字典检查
                 if target_key not in modules:
-                    # 对意外情况（如未找到模块）使用 logger.warning
-                    self.logger.warning(
-                        _colorize(
-                            f"  [跳过][{_colorize('权重', COLOR_TARGET)}] 模块 '{_colorize(target_key, COLOR_MODULE)}' 在追踪的模型模块中未找到。",
-                            COLOR_WARN,
+                    # 如果模块不在字典里（例如，被融合掉的 BN），跳过
+                    if self.debug:
+                        self.logger.debug(
+                            _colorize(
+                                f"  [信息][{_colorize('权重', COLOR_TARGET)}] 模块 '{_colorize(target_key, COLOR_MODULE)}' 不在当前模块字典中。跳过权重检查。",
+                                COLOR_DEBUG,
+                            )
                         )
-                    )
-                    continue
+                    continue  # 跳过处理不存在的模块
 
-                target_module = modules.get(target_key)
+                target_module = modules.get(target_key)  # 使用更新后的 modules
 
+                # 检查的是融合后的模块 (例如，Conv2d 是否需要量化权重)
                 if (
                     target_module
                     and is_quantizable_weight_module(target_module)
                     and self.qconfig.weight
-                    and hasattr(target_module, "weight")
+                    and hasattr(target_module, "weight")  # 融合后的层肯定有 weight
                     and target_module.weight is not None
                 ):
                     weight_quant_module_cls = self.qconfig.weight
                     weight_quant_instance = weight_quant_module_cls()
+                    # 使用融合后模块的名称生成观察器名称
                     quant_module_name = self._get_unique_module_name(
-                        f"weight_obs_{target_key.replace('.', '_')}"
+                        f"weight_quant_{target_key.replace('.', '_')}"
                     )
-                    traced_model.add_module(quant_module_name, weight_quant_instance)
+                    # 在 prepared_model (可能已融合) 上添加模块
+                    prepared_model.add_module(quant_module_name, weight_quant_instance)
 
+                    # 目标是融合后模块的权重
                     weight_attr_target = f"{target_key}.weight"
-                    # 插入信息是 DEBUG 级别
                     self.logger.debug(
                         _colorize(
-                            f"  [{_colorize('插入', COLOR_ACTION)}][{_colorize('权重', COLOR_TARGET)}] 发现可量化模块: '{_colorize(target_key, COLOR_MODULE)}'。 "
+                            f"  [{_colorize('插入', COLOR_ACTION)}][{_colorize('权重', COLOR_TARGET)}] 发现可量化模块: '{_colorize(target_key, COLOR_MODULE)}' ({type(target_module).__name__})。 "
                             f"为 '{_colorize(weight_attr_target, COLOR_TARGET)}' 插入量化器 '{_colorize(quant_module_name, COLOR_MODULE)}'。",
                             COLOR_DEBUG,
                         )
                     )
 
+                    # 图操作在融合后的 graph 上进行
                     with graph.inserting_before(node):
+                        # 1. 获取权重属性
                         get_attr_node = graph.get_attr(weight_attr_target)
+                        # 2. 调用权重观察器
                         observer_call_node = graph.call_module(
                             quant_module_name, args=(get_attr_node,)
                         )
-                        # FX会自动处理输入替换，这里显式调用以确保清晰
+                        # 3. 将原始模块节点对权重的引用替换为观察器的输出
+                        # 注意：这里修改的是 node (e.g., conv2d) 的 *输入参数列表* 中
+                        # 对 `target_key.weight` 的引用，而不是直接替换 get_attr 节点。
+                        # 这需要知道 weight 参数在 call_module 中的位置，通常是第一个非 self 参数。
+                        # 更健壮的方式是使用 node.replace_input_with(old_node, new_node)
+                        # 这里我们假设 get_attr_node 就是那个旧输入。
                         node.replace_input_with(get_attr_node, observer_call_node)
 
-                    # 详细的插入步骤是 DEBUG 级别
                     self.logger.debug(
                         _colorize(
-                            f"    -> 插入 {_colorize('get_attr', COLOR_OPERATOR)}: '{_colorize(get_attr_node.name, COLOR_NODE)}'",
+                            f"    -> 插入 {_colorize('get_attr', COLOR_OPERATOR)}: '{_colorize(get_attr_node.name, COLOR_NODE)}' (获取 '{weight_attr_target}')",
                             COLOR_DEBUG,
                         )
                     )
                     self.logger.debug(
                         _colorize(
-                            f"    -> 插入 {_colorize('call_module', COLOR_MODULE)} (权重 量化器): '{_colorize(observer_call_node.name, COLOR_NODE)}'",
+                            f"    -> 插入 {_colorize('call_module', COLOR_MODULE)} (权重 量化器): '{_colorize(observer_call_node.name, COLOR_NODE)}' (调用 '{quant_module_name}')",
                             COLOR_DEBUG,
                         )
                     )
                     self.logger.debug(
                         _colorize(
-                            f"    -> 更新 '{_colorize(node.name, COLOR_NODE)}' 的输入以使用量化器输出。",
+                            f"    -> 更新 '{_colorize(node.name, COLOR_NODE)}' 的输入，用 '{_colorize(observer_call_node.name, COLOR_NODE)}' 替换 '{_colorize(get_attr_node.name, COLOR_NODE)}'。",
                             COLOR_DEBUG,
                         )
                     )
-
                 elif (
-                    self.debug  # 仅在调试模式下记录跳过原因
+                    self.debug
                     and target_module
                     and is_quantizable_weight_module(target_module)
                 ):
                     reason = ""
                     if not self.qconfig.weight:
-                        reason = "QConfig 没有配置权重量化器 (`qconfig.weight` 为 None)"
+                        reason = "QConfig 未配置权重量化器"
                     elif not hasattr(target_module, "weight"):
-                        reason = f"模块没有 'weight' 属性"
+                        reason = "模块无 'weight' 属性"
                     elif target_module.weight is None:
-                        reason = f"模块 'weight' 属性为 None"
-                    # 由于配置或正常原因跳过是 DEBUG 级别
+                        reason = "模块 'weight' 属性为 None"
+                    else:
+                        reason = "未知原因 (可能已满足其他条件)"
                     self.logger.debug(
                         _colorize(
-                            f"  [跳过][{_colorize('权重', COLOR_TARGET)}] 模块 '{_colorize(target_key, COLOR_MODULE)}' 是可量化类型，但跳过量化器插入。 "
-                            f"{_colorize('原因:', COLOR_REASON)} {reason}",
+                            f"  [跳过][{_colorize('权重', COLOR_TARGET)}] 模块 '{_colorize(target_key, COLOR_MODULE)}' ({type(target_module).__name__})。 {_colorize('原因:', COLOR_REASON)} {reason}",
                             COLOR_DEBUG,
                         )
                     )
-                # 跳过不可量化的权重模块非常冗长，保持为 DEBUG
-                # elif self.debug:
-                #     self.logger.debug(
-                #         _colorize(
-                #             f"  [信息][{_colorize('权重', COLOR_TARGET)}] 模块 '{_colorize(target_key, COLOR_MODULE)}' 不是权重可量化的类型。",
-                #             COLOR_DEBUG,
-                #         )
-                #     )
 
-            # --- 激活 量化器 插入 ---
+            # --- 激活量化器插入 ---
             should_quantize_output = False
             output_prefix = ""
             reason_for_quantization = ""
             origin_node_desc = ""
-            is_output_from_quant_module = False
+            is_output_from_quant_module = False  # 标记当前节点是否就是个量化器
 
+            # 检查当前节点是否已经是量化器调用
             if node.op == "call_module":
                 target_key = str(node.target)
                 if target_key in modules:
                     current_module = modules.get(target_key)
-                    is_act_obs_inst = self.qconfig.activation and isinstance(
+                    # 检查是否是 QConfig 中定义的激活或权重量化器实例
+                    is_act_quant_inst = self.qconfig.activation and isinstance(
                         current_module, self.qconfig.activation
                     )
-                    is_wt_obs_inst = self.qconfig.weight and isinstance(
+                    # 权重观察器后面通常不需要再加激活观察器
+                    is_wt_quant_inst = self.qconfig.weight and isinstance(
                         current_module, self.qconfig.weight
                     )
-                    if is_act_obs_inst or is_wt_obs_inst:
+                    if is_act_quant_inst or is_wt_quant_inst:
                         is_output_from_quant_module = True
-                        # 跳过的解释是 DEBUG 级别
-                        self.logger.debug(
-                            _colorize(
-                                f"  [信息][{_colorize('激活', COLOR_TARGET)}] 节点 '{_colorize(node.name, COLOR_NODE)}' 已经是量化器调用 "
-                                f"('{_colorize(target_key, COLOR_MODULE)}')，在其后不需要量化器。",
-                                COLOR_DEBUG,
+                        if self.debug:
+                            self.logger.debug(
+                                _colorize(
+                                    f"  [信息][{_colorize('激活', COLOR_TARGET)}] 节点 '{_colorize(node.name, COLOR_NODE)}' 本身是量化器调用 ('{_colorize(target_key, COLOR_MODULE)}').",
+                                    COLOR_DEBUG,
+                                )
                             )
-                        )
 
+            # 决定是否需要量化当前节点的输出 (如果它不是量化器本身)
             if not is_output_from_quant_module and self.qconfig.activation:
-                target_key = str(node.target)
+                target_key = str(node.target)  # 重新获取以防万一
                 if node.op == "call_module":
+                    # 使用更新后的 modules 检查
                     if target_key in modules:
                         target_module = modules.get(target_key)
+                        # 检查融合后的模块 (或其他模块) 是否需要激活量化
                         if target_module and is_quantizable_activation_module(
                             target_module
                         ):
                             should_quantize_output = True
-                            target_str = target_key.replace(".", "_")
-                            output_prefix = f"act_obs_after_mod_{target_str}"
-                            origin_node_desc = (
-                                f"可量化模块 '{_colorize(target_key, COLOR_MODULE)}'"
-                            )
+                            target_str_safe = target_key.replace(".", "_")
+                            output_prefix = f"act_quant_after_mod_{target_str_safe}"
+                            origin_node_desc = f"模块 '{_colorize(target_key, COLOR_MODULE)}' ({type(target_module).__name__})"
                             reason_for_quantization = f"{origin_node_desc} 的输出"
+                    # else: # 如果模块不在字典里（如被融合的 BN），自然不需要为其输出加观察器
                 elif node.op == "call_function":
+                    # hasattr 检查是为了防止 node.target 是字符串或其他非 callable 对象
                     if callable(node.target) and is_quantizable_activation_function(
                         node.target
                     ):
                         should_quantize_output = True
-                        func_name = getattr(node.target, "__name__", target_key)
-                        output_prefix = f"act_obs_after_func_{func_name}"
+                        func_name = getattr(node.target, "__name__", str(node.target))
+                        output_prefix = f"act_quant_after_func_{func_name}"
                         origin_node_desc = (
-                            f"可量化函数 '{_colorize(func_name, COLOR_OPERATOR)}'"
+                            f"函数 '{_colorize(func_name, COLOR_OPERATOR)}'"
                         )
                         reason_for_quantization = f"{origin_node_desc} 的输出"
-                    elif self.debug and callable(node.target):
-                        # 跳过不可量化的函数是 DEBUG 信息
-                        self.logger.debug(
-                            _colorize(
-                                f"  [信息][{_colorize('激活', COLOR_TARGET)}] 函数 '{_colorize(getattr(node.target, '__name__', target_key), COLOR_OPERATOR)}' 的输出不需要观察。",
-                                COLOR_DEBUG,
-                            )
-                        )
+                    # elif self.debug and callable(node.target): # 不可量化的function的debug信息
+                    #     self.logger.debug(...)
                 elif node.op == "call_method":
-                    method_name = target_key
+                    method_name = target_key  # 对于 call_method, target 是方法名字符串
                     if is_quantizable_activation_method(method_name):
                         should_quantize_output = True
-                        output_prefix = f"act_obs_after_method_{method_name}"
+                        output_prefix = f"act_quant_after_method_{method_name}"
                         origin_node_desc = (
-                            f"可量化方法 '{_colorize(method_name, COLOR_OPERATOR)}'"
+                            f"方法 '{_colorize(method_name, COLOR_OPERATOR)}'"
                         )
                         reason_for_quantization = f"{origin_node_desc} 的输出"
-                    elif self.debug:
-                        # 跳过不可量化的方法是 DEBUG 信息
-                        self.logger.debug(
-                            _colorize(
-                                f"  [信息][{_colorize('激活', COLOR_TARGET)}] 方法 '{_colorize(method_name, COLOR_OPERATOR)}' 的输出不需要观察。",
-                                COLOR_DEBUG,
-                            )
-                        )
+                    # elif self.debug: # 不可量化的method的debug信息
+                    #      self.logger.debug(...)
                 elif node.op == "placeholder":
-                    already_observed_by_user = False
+                    # 输入占位符通常需要观察，除非其用户已经是观察器
+                    already_quantized_by_user = False
                     for user in node.users:
                         user_target_key = str(user.target)
                         if user.op == "call_module" and user_target_key in modules:
@@ -406,109 +535,110 @@ class Quantizer:
                             if self.qconfig.activation and isinstance(
                                 user_module, self.qconfig.activation
                             ):
-                                already_observed_by_user = True
-                                # 跳过已被观察的占位符是 DEBUG 信息
-                                self.logger.debug(
-                                    _colorize(
-                                        f"  [跳过][{_colorize('激活', COLOR_TARGET)}] 输入占位符 '{_colorize(node.name, COLOR_INPUT)}' 已被用户节点 "
-                                        f"'{_colorize(user.name, COLOR_NODE)}' ({_colorize(user_target_key, COLOR_MODULE)}) 观察。",
-                                        COLOR_DEBUG,
+                                already_quantized_by_user = True
+                                if self.debug:
+                                    self.logger.debug(
+                                        _colorize(
+                                            f"  [跳过][{_colorize('激活', COLOR_TARGET)}] 输入 '{_colorize(node.name, COLOR_INPUT)}' 已被用户 '{_colorize(user.name, COLOR_NODE)}' ({_colorize(user_target_key, COLOR_MODULE)}) 观察。",
+                                            COLOR_DEBUG,
+                                        )
                                     )
-                                )
-                                break
-                    if not already_observed_by_user:
+                                break  # 只要有一个用户是观察器就够了
+                    if not already_quantized_by_user:
                         should_quantize_output = True
-                        output_prefix = f"act_obs_input_{node.target}"
+                        # node.target 是占位符的名称 (例如 'x')
+                        output_prefix = f"act_quant_input_{node.target}"
                         origin_node_desc = (
-                            f"输入占位符 '{_colorize(node.target, COLOR_INPUT)}'"
+                            f"输入 '{_colorize(node.target, COLOR_INPUT)}'"
                         )
-                        reason_for_quantization = f"来自 {origin_node_desc} 的输入"
+                        reason_for_quantization = f"{origin_node_desc} 的值"
 
+            # 插入激活量化器（如果需要且 QConfig 配置了）
             if should_quantize_output and self.qconfig.activation:
-                is_already_observed_by_user = False
+                # 再次检查：这个节点的输出是否已经被某个下游节点观察了
+                # (这主要处理 M 输出 -> 多个 Op，其中一个 Op 是 Quant 的情况)
+                # 但更常见的是在 placeholder 检查中处理输入观察。
+                # 对于中间节点，我们通常在其 *之后* 插入观察器。
+                # 这个检查主要是为了防止在已经有观察器的地方重复插入。
+                is_already_quantized_by_user = False
                 for user in node.users:
                     user_target_key = str(user.target)
                     if user.op == "call_module" and user_target_key in modules:
                         user_module = modules.get(user_target_key)
+                        # 如果用户节点本身就是激活观察器
                         if isinstance(user_module, self.qconfig.activation):
-                            is_already_observed_by_user = True
-                            # 跳过已被观察的输出是 DEBUG 信息
-                            self.logger.debug(
-                                _colorize(
-                                    f"  [跳过][{_colorize('激活', COLOR_TARGET)}] 节点 '{_colorize(node.name, COLOR_NODE)}' 的输出 ({reason_for_quantization}) 已被后续用户 "
-                                    f"'{_colorize(user.name, COLOR_NODE)}' ({_colorize(user_target_key, COLOR_MODULE)}) 观察。",
-                                    COLOR_DEBUG,
+                            is_already_quantized_by_user = True
+                            if self.debug:
+                                self.logger.debug(
+                                    _colorize(
+                                        f"  [跳过][{_colorize('激活', COLOR_TARGET)}] 节点 '{_colorize(node.name, COLOR_NODE)}' 的输出 ({reason_for_quantization}) 已被后续用户 "
+                                        f"'{_colorize(user.name, COLOR_NODE)}' ('{_colorize(user_target_key, COLOR_MODULE)}') 观察。",
+                                        COLOR_DEBUG,
+                                    )
                                 )
-                            )
                             break
 
-                if not is_already_observed_by_user:
+                if not is_already_quantized_by_user:
                     act_quant_module_cls = self.qconfig.activation
                     act_quant_instance = act_quant_module_cls()
                     quant_module_name = self._get_unique_module_name(output_prefix)
-                    traced_model.add_module(quant_module_name, act_quant_instance)
+                    prepared_model.add_module(quant_module_name, act_quant_instance)
 
-                    # 插入消息是 DEBUG 级别
                     self.logger.debug(
                         _colorize(
-                            f"  [{_colorize('插入', COLOR_ACTION)}][{_colorize('激活', COLOR_TARGET)}] 节点 '{_colorize(node.name, COLOR_NODE)}' 需要输出观察。 "
+                            f"  [{_colorize('插入', COLOR_ACTION)}][{_colorize('激活', COLOR_TARGET)}] 节点 '{_colorize(node.name, COLOR_NODE)}' 的输出需要观察。 "
                             f"{_colorize('原因:', COLOR_REASON)} {reason_for_quantization}. "
                             f"插入量化器 '{_colorize(quant_module_name, COLOR_MODULE)}'。",
                             COLOR_DEBUG,
                         )
                     )
 
+                    # 在当前节点之后插入量化器调用
                     with graph.inserting_after(node):
                         inserted_node = graph.call_module(
-                            quant_module_name, args=(node,)
+                            quant_module_name, args=(node,)  # 观察器的输入是当前节点
                         )
 
-                    # 获取当前节点的所有用户
-                    users_to_update = list(node.users.keys())
+                    # 将原节点的所有用户（除了新插入的观察器节点本身）
+                    # 的输入从原节点更新为新插入的观察器节点
+                    users_to_update = list(node.users.keys())  # 创建副本以安全迭代
                     updated_users_count = 0
-                    # 遍历所有用户并更新它们的输入
                     for user_node in users_to_update:
-                        # 确保不更新刚刚插入的量化器节点自身
-                        if user_node != inserted_node:
+                        if user_node != inserted_node:  # 不要更新观察器节点自己
                             user_node.replace_input_with(node, inserted_node)
                             updated_users_count += 1
-
-                    # 确保插入的节点明确以原节点为参数
+                    # 确保插入节点的参数是正确的 (虽然 insert_after 通常会做)
                     inserted_node.args = (node,)
 
-                    # 插入的细节是 DEBUG 级别
                     self.logger.debug(
                         _colorize(
-                            f"    -> 插入 {_colorize('call_module', COLOR_MODULE)} (激活 量化器): '{_colorize(inserted_node.name, COLOR_NODE)}'",
+                            f"    -> 插入 {_colorize('call_module', COLOR_MODULE)} (激活 量化器): '{_colorize(inserted_node.name, COLOR_NODE)}' (调用 '{quant_module_name}')",
                             COLOR_DEBUG,
                         )
                     )
                     self.logger.debug(
                         _colorize(
-                            f"    -> 更新了 '{_colorize(node.name, COLOR_NODE)}' 的 {updated_users_count} 个用户，使其使用 '{_colorize(inserted_node.name, COLOR_NODE)}'。",
+                            f"    -> 更新了 '{_colorize(node.name, COLOR_NODE)}' 的 {updated_users_count} 个下游用户，使其使用 '{_colorize(inserted_node.name, COLOR_NODE)}'。",
                             COLOR_DEBUG,
                         )
                     )
-
-            # 记录跳过激活的原因 *仅当* 处于调试模式 *且* 不是因为它已经是观察器时
             elif (
                 self.debug
-                and not should_quantize_output
-                and not is_output_from_quant_module
-                and node.op != "output"  # 输出节点通常不需要观察
+                and not should_quantize_output  # 不需要量化输出
+                and not is_output_from_quant_module  # 且节点本身不是量化器
+                and node.op != "output"  # 且不是最终输出节点
             ):
-                if not self.qconfig.activation:
-                    if not self._printed_no_activation_config:
-                        # 将缺少配置记录为 INFO 一次（在非调试模式下也可见）
-                        self.logger.info(
+                if not self.qconfig.activation:  # 如果是因为没配置激活量化器
+                    if not self._printed_no_activation_config:  # 只打印一次
+                        self.logger.debug(
                             _colorize(
-                                f"  [信息][{_colorize('激活', COLOR_TARGET)}] 跳过激活量化器。 "
-                                f"{_colorize('原因:', COLOR_REASON)} QConfig 没有配置激活量化器 (`qconfig.activation` 为 None)。",
+                                f"  [信息][{_colorize('激活', COLOR_TARGET)}] 跳过所有激活量化器插入。{_colorize('原因:', COLOR_REASON)} QConfig 未配置激活量化器。",
                                 COLOR_INFO,
                             )
                         )
                         self._printed_no_activation_config = True
-                # 其他跳过（不可量化类型等）如果调试开启，已在上面记录。
+                # else: # 如果配置了，但当前节点不满足条件 (e.g., 非量化类型)
+                #     self.logger.debug(...) # 可以选择性地记录为什么这个特定节点跳过
 
         # --- 清理和重新编译 ---
         try:
@@ -519,7 +649,7 @@ class Quantizer:
                 )
             )
             graph.lint()  # 检查图的结构是否有效
-            prepared_model = GraphModule(traced_model, graph)  # 重新创建 GraphModule
+            prepared_model = GraphModule(prepared_model, graph)  # 重新创建 GraphModule
             self.logger.debug(_colorize("[成功] 图校验通过", COLOR_SUCCESS))
         except Exception as e:
             # 这里也使用 logger.exception
@@ -546,26 +676,34 @@ class Quantizer:
         if self.debug:
             self.logger.debug(
                 _colorize(
-                    "\n--- 最终 FX 图 (准备阶段后) ---",
+                    "\n--- 最终 FX 图 (准备阶段完成) ---",
                     COLOR_BOLD + COLOR_INFO,
                 )
             )
-            prepared_model.graph.print_tabular()  # 直接打印以进行调试
+            prepared_model.graph.print_tabular()
             self.logger.debug(
-                _colorize("--- (结束准备图) ---\n", COLOR_BOLD + COLOR_INFO)
+                _colorize("--- (结束最终图) ---\n", COLOR_BOLD + COLOR_INFO)
             )
 
-        # 使用 logger.info 标记阶段完成（在两种模式下都可见）
+        # 恢复原始模型的训练状态 (虽然返回的是副本)
+        model.train(original_training_state)
+
         self.logger.info(
             _colorize(
                 f"{'='*20} 量化准备阶段完成 {'='*20}",
                 COLOR_PHASE + COLOR_SUCCESS,
             )
         )
+        fusion_status = "未启用BN融合"
+        if self.fuse_bn:
+            fusion_status = (
+                "已执行BN融合" if fusion_executed else "尝试BN融合但未找到可融合对"
+            )
+
         self.logger.info(
             _colorize(
-                "模型准备完毕：已为权重和激活插入量化器, 量化图构建完毕",
+                f"模型准备完毕 ({fusion_status}, 已插入权重和激活量化器)。",
                 COLOR_SUCCESS,
             )
         )
-        return prepared_model
+        return prepared_model  # 返回准备好的模型副本

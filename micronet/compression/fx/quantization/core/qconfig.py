@@ -42,7 +42,6 @@ class QConfig:
 
 
 # --- 默认 QConfig 示例 ---
-# 使用上面定义的占位符模块创建一些默认配置
 
 # 适用于 PTQ (Post Training Quantization) 的默认配置，使用占位符 Observer
 default_placeholder_ptq_qconfig = QConfig(

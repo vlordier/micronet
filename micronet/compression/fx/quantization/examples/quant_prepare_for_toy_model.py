@@ -41,11 +41,11 @@ prepared_ptq_model = ptq_quantizer.prepare(float_model)
 # 4. 准备 QAT (使用 QAT QConfig)
 float_model_for_qat = ToyModel().train()  # QAT 需要模型在 train 模式
 qat_quantizer = Quantizer(qconfig=default_placeholder_qat_qconfig)
-prepared_qat_model = qat_quantizer.prepare(float_model_for_qat)  # 传入 train 模式的模型
+prepared_qat_model = qat_quantizer.prepare(float_model_for_qat)
 qat_quantizer = Quantizer(qconfig=default_placeholder_qat_qconfig, debug=True)
-prepared_qat_model = qat_quantizer.prepare(float_model_for_qat)  # 传入 train 模式的模型
+prepared_qat_model = qat_quantizer.prepare(float_model_for_qat)
 
-# 5. (可选) 测试准备后的模型是否能前向传播
+# 5. 测试准备后的模型是否能前向传播
 print("\n测试 PTQ 准备后模型的前向传播...")
 dummy_input = torch.randn(1, 1, 7, 7)
 try:

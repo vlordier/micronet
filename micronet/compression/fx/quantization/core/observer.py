@@ -1,4 +1,4 @@
-from typing import Tuple  # Python 3.9 之前
+from typing import Tuple
 
 import torch
 import torch.nn as nn
@@ -17,12 +17,10 @@ class PlaceholderObserver(nn.Module):
         """
         super().__init__()
         # 实际的 Observer 会在这里初始化统计量 buffer，例如 min_val, max_val
-        # 使用 torch.tensor 需要导入 torch
         self.register_buffer("min_val", torch.tensor(float("inf")))
-        self.register_buffer("max_val", torch.tensor(float("-inf")))  # 示例 buffer
+        self.register_buffer("max_val", torch.tensor(float("-inf")))
         # print(f"  [PlaceholderObserver {id(self)}] 初始化") # 暂时注释掉打印
 
-    # forward 方法的类型提示需要 torch.Tensor
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         在 forward 传递中“观察”输入张量。
@@ -31,12 +29,11 @@ class PlaceholderObserver(nn.Module):
         """
         # 实际观察逻辑:
         # if x.is_floating_point():
-        #     self.min_val = torch.min(x.min(), self.min_val) # 需要 torch.min
-        #     self.max_val = torch.max(x.max(), self.max_val) # 需要 torch.max
+        #     self.min_val = torch.min(x.min(), self.min_val)
+        #     self.max_val = torch.max(x.max(), self.max_val)
         # print(f"  [PlaceholderObserver {id(self)}] 观察到输入形状: {x.shape}")
         return x
 
-    # calculate_qparams 的返回类型提示需要 Tuple 和 torch.Tensor
     def calculate_qparams(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         计算量化参数（scale, zero_point）。
@@ -46,8 +43,8 @@ class PlaceholderObserver(nn.Module):
         # 实际计算逻辑会在这里
         # print(f"  [PlaceholderObserver {id(self)}] 计算量化参数 (占位符)")
         # 返回示例值，实际应基于 min_val, max_val 计算
-        scale = torch.tensor(1.0)  # 需要 torch.tensor
-        zero_point = torch.tensor(0)  # 需要 torch.tensor
+        scale = torch.tensor(1.0)
+        zero_point = torch.tensor(0)
         return scale, zero_point
 
     def __repr__(self) -> str:
