@@ -1,6 +1,4 @@
 import unittest
-import io
-import logging
 import sys
 import torch
 import torch.nn as nn
@@ -9,11 +7,11 @@ from torch.fx import GraphModule
 
 try:
     from micronet.compression.fx.quantization.core.quantizer import Quantizer
-    from micronet.compression.fx.quantization.core.observer import PlaceholderObserver
+    from micronet.compression.fx.quantization.core.fake_quant import FakeQuantize
     from micronet.compression.fx.quantization.core.qconfig import (
         QConfig,
-        default_placeholder_ptq_qconfig,
-        default_placeholder_qat_qconfig,
+        default_ptq_qconfig,
+        default_qat_qconfig,
     )
     from micronet.compression.fx.quantization.core.graph_utils import (
         is_quantizable_weight_module,
@@ -48,9 +46,9 @@ def count_quantizer_nodes(graph_module: GraphModule, qconfig: QConfig):
             if module:
                 # 检查这个权重量化器的输入是否是 get_attr (通常是)
                 if node.args and node.args[0].op == "get_attr":
-                    if qconfig.weight and isinstance(module, qconfig.weight):
+                    if qconfig.weight and isinstance(module, FakeQuantize):
                         weight_quant_count += 1
-                elif qconfig.activation and isinstance(module, qconfig.activation):
+                elif qconfig.activation and isinstance(module, FakeQuantize):
                     act_quant_count += 1
     return weight_quant_count, act_quant_count
 
@@ -191,8 +189,8 @@ class TestQuantizer(unittest.TestCase):
     def setUp(self):
         """在每个测试方法运行前设置"""
         # 默认 QConfig
-        self.ptq_qconfig = default_placeholder_ptq_qconfig
-        self.qat_qconfig = default_placeholder_qat_qconfig
+        self.ptq_qconfig = default_ptq_qconfig
+        self.qat_qconfig = default_qat_qconfig
 
     def run_prepare_test(
         self, model_name, model, qconfig, expected_weights, expected_acts, debug=False
@@ -234,7 +232,7 @@ class TestQuantizer(unittest.TestCase):
                 # 检查权重量化器是否正确插入在其使用者之前
                 if qconfig.weight and node.op == "call_module":
                     module = modules.get(str(node.target))
-                    if module and isinstance(module, qconfig.weight):
+                    if module and isinstance(module, FakeQuantize):
                         # 检查输入是否 get_attr
                         self.assertEqual(len(node.args), 1)
                         input_node = node.args[0]
@@ -256,7 +254,7 @@ class TestQuantizer(unittest.TestCase):
                 # 检查激活量化器是否在其源节点之后插入
                 if qconfig.activation and node.op == "call_module":
                     module = modules.get(str(node.target))
-                    if module and isinstance(module, qconfig.activation):
+                    if module and isinstance(module, FakeQuantize):
                         self.assertEqual(len(node.args), 1)
                         input_node = node.args[0]  # 获取被观察的节点
                         self.assertIn(
@@ -307,13 +305,13 @@ class TestQuantizer(unittest.TestCase):
     def test_03_init_invalid_qconfig_callable(self):
         """测试 Quantizer 初始化 (无效 QConfig 可调用对象)"""
         print("\n--- 测试: Quantizer 初始化 (无效 QConfig 可调用对象) ---")
-        invalid_cfg1 = QConfig(activation="not callable", weight=PlaceholderObserver)
+        invalid_cfg1 = QConfig(activation="not callable", weight=FakeQuantize)
         with self.assertRaisesRegex(
             TypeError, "qconfig.activation 必须是可调用的工厂函数或 None"
         ):
             Quantizer(qconfig=invalid_cfg1)
 
-        invalid_cfg2 = QConfig(activation=PlaceholderObserver, weight=123)
+        invalid_cfg2 = QConfig(activation=FakeQuantize, weight=123)
         with self.assertRaisesRegex(
             TypeError, "qconfig.weight 必须是可调用的工厂函数或 None"
         ):
@@ -367,7 +365,7 @@ class TestQuantizer(unittest.TestCase):
     def test_06_prepare_simple_model_no_activation(self):
         """测试 prepare: SimpleModel (仅权重量化)"""
         model = SimpleModel()
-        qconfig = QConfig(activation=None, weight=PlaceholderObserver)
+        qconfig = QConfig(activation=None, weight=FakeQuantize)
         expected_weights = 2
         expected_acts = 0  # 不量化激活
         prepared = self.run_prepare_test(
@@ -382,7 +380,7 @@ class TestQuantizer(unittest.TestCase):
     def test_07_prepare_simple_model_no_weight(self):
         """测试 prepare: SimpleModel (仅激活量化)"""
         model = SimpleModel()
-        qconfig = QConfig(activation=PlaceholderObserver, weight=None)
+        qconfig = QConfig(activation=FakeQuantize, weight=None)
         expected_weights = 0  # 不量化权重
         expected_acts = 6
         prepared = self.run_prepare_test(

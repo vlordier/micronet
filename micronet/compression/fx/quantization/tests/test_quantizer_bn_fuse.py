@@ -7,15 +7,15 @@ import torch.nn as nn
 from micronet.compression.fx.quantization.core.quantizer import Quantizer
 from micronet.compression.fx.quantization.core.qconfig import (
     QConfig,
-    default_placeholder_qconfig,
+    default_qconfig,
 )
-from micronet.compression.fx.quantization.core.observer import PlaceholderObserver
+from micronet.compression.fx.quantization.core.fake_quant import FakeQuantize
 
 
 class TestQuantizerBnFuse(unittest.TestCase):
 
     def setUp(self):
-        self.qconfig = default_placeholder_qconfig
+        self.qconfig = default_qconfig
         self.default_input_conv = torch.randn(1, 3, 16, 16)
         self.default_input_linear = torch.randn(1, 10)
         torch.manual_seed(1)
@@ -68,25 +68,29 @@ class TestQuantizerBnFuse(unittest.TestCase):
         # 2. 检查是否有量化器插入（至少应该有输入和 Conv 输出的观察器）
         found_observer = False
         for name, module in final_modules.items():
-            if isinstance(module, PlaceholderObserver):
+            if isinstance(module, FakeQuantize):
                 found_observer = True
                 break
         self.assertTrue(found_observer, "模型中应包含插入的 Observer 模块")
         # 更具体地检查图
         graph = prepared_model.graph
-        # 应该有对 act_quant_input_... 的调用 (对输入)
-        # 应该有对 weight_quant_... 的调用 (对 conv 权重)
-        # 应该有对 act_quant_after_mod_0... 的调用 (对 conv 输出)
+        # 应该有对 act_fake_quant_input_... 的调用 (对输入)
+        # 应该有对 weight_fake_quant_... 的调用 (对 conv 权重)
+        # 应该有对 act_fake_quant_after_mod_0... 的调用 (对 conv 输出)
         observer_calls = [
             n.target
             for n in graph.nodes
             if n.op == "call_module"
-            and isinstance(final_modules.get(str(n.target)), PlaceholderObserver)
+            and isinstance(final_modules.get(str(n.target)), FakeQuantize)
         ]
-        self.assertTrue(any(s.startswith("act_quant_input") for s in observer_calls))
-        self.assertTrue(any(s.startswith("weight_quant_0") for s in observer_calls))
         self.assertTrue(
-            any(s.startswith("act_quant_after_mod_0") for s in observer_calls)
+            any(s.startswith("act_fake_quant_input") for s in observer_calls)
+        )
+        self.assertTrue(
+            any(s.startswith("weight_fake_quant_0") for s in observer_calls)
+        )
+        self.assertTrue(
+            any(s.startswith("act_fake_quant_after_mod_0") for s in observer_calls)
         )
 
         # 3. 检查图中 BN 节点是否消失
@@ -121,19 +125,23 @@ class TestQuantizerBnFuse(unittest.TestCase):
 
         # 2. 检查量化器插入
         self.assertTrue(
-            any(isinstance(m, PlaceholderObserver) for m in final_modules.values())
+            any(isinstance(m, FakeQuantize) for m in final_modules.values())
         )
         graph = prepared_model.graph
         observer_calls = [
             n.target
             for n in graph.nodes
             if n.op == "call_module"
-            and isinstance(final_modules.get(str(n.target)), PlaceholderObserver)
+            and isinstance(final_modules.get(str(n.target)), FakeQuantize)
         ]
-        self.assertTrue(any(s.startswith("act_quant_input") for s in observer_calls))
-        self.assertTrue(any(s.startswith("weight_quant_0") for s in observer_calls))
         self.assertTrue(
-            any(s.startswith("act_quant_after_mod_0") for s in observer_calls)
+            any(s.startswith("act_fake_quant_input") for s in observer_calls)
+        )
+        self.assertTrue(
+            any(s.startswith("weight_fake_quant_0") for s in observer_calls)
+        )
+        self.assertTrue(
+            any(s.startswith("act_fake_quant_after_mod_0") for s in observer_calls)
         )
 
         # 3. 检查图中 BN 节点消失
@@ -168,27 +176,29 @@ class TestQuantizerBnFuse(unittest.TestCase):
 
         # 2. 检查量化器插入 (应该在 Conv 输出, ReLU 输出, BN 输出等地方有)
         self.assertTrue(
-            any(isinstance(m, PlaceholderObserver) for m in final_modules.values())
+            any(isinstance(m, FakeQuantize) for m in final_modules.values())
         )
         graph = prepared_model.graph
         observer_calls = {
             str(n.target)
             for n in graph.nodes
             if n.op == "call_module"
-            and isinstance(final_modules.get(str(n.target)), PlaceholderObserver)
+            and isinstance(final_modules.get(str(n.target)), FakeQuantize)
         }
         # print("Observer calls (no pattern):", observer_calls)
         # 应该观察 conv(0) 的权重和输出，relu(1) 的输出，bn(2) 的输出
-        self.assertTrue(any(s.startswith("weight_quant_0") for s in observer_calls))
         self.assertTrue(
-            any(s.startswith("act_quant_after_mod_0") for s in observer_calls)
+            any(s.startswith("weight_fake_quant_0") for s in observer_calls)
         )
         self.assertTrue(
-            any(s.startswith("act_quant_after_mod_1") for s in observer_calls)
+            any(s.startswith("act_fake_quant_after_mod_0") for s in observer_calls)
+        )
+        self.assertTrue(
+            any(s.startswith("act_fake_quant_after_mod_1") for s in observer_calls)
         )  # After ReLU
         # BN 默认也会被观察
         self.assertTrue(
-            any(s.startswith("act_quant_after_mod_2") for s in observer_calls)
+            any(s.startswith("act_fake_quant_after_mod_2") for s in observer_calls)
         )  # After BN
 
         # 3. 检查图中 BN 节点 ('2') 仍然存在
@@ -213,21 +223,23 @@ class TestQuantizerBnFuse(unittest.TestCase):
 
         # 2. 检查量化器插入 (应该在 Conv 输出, BN 输出等地方有)
         self.assertTrue(
-            any(isinstance(m, PlaceholderObserver) for m in final_modules.values())
+            any(isinstance(m, FakeQuantize) for m in final_modules.values())
         )
         graph = prepared_model.graph
         observer_calls = {
             str(n.target)
             for n in graph.nodes
             if n.op == "call_module"
-            and isinstance(final_modules.get(str(n.target)), PlaceholderObserver)
+            and isinstance(final_modules.get(str(n.target)), FakeQuantize)
         }
-        self.assertTrue(any(s.startswith("weight_quant_0") for s in observer_calls))
         self.assertTrue(
-            any(s.startswith("act_quant_after_mod_0") for s in observer_calls)
+            any(s.startswith("weight_fake_quant_0") for s in observer_calls)
         )
         self.assertTrue(
-            any(s.startswith("act_quant_after_mod_1") for s in observer_calls)
+            any(s.startswith("act_fake_quant_after_mod_0") for s in observer_calls)
+        )
+        self.assertTrue(
+            any(s.startswith("act_fake_quant_after_mod_1") for s in observer_calls)
         )  # After BN
 
         # 3. 检查图中 BN 节点 ('1') 仍然存在

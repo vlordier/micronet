@@ -7,6 +7,8 @@ import torch.fx as fx
 from torch.fx.graph_module import GraphModule
 
 from .qconfig import QConfig
+
+from .fake_quant import FakeQuantize
 from .graph_utils import (
     fuse_conv_linear_bn_fx,
     is_quantizable_weight_module,
@@ -51,7 +53,8 @@ class Quantizer:
     它的主要功能包括：
     1. (可选) 模型融合：自动检测并融合常见的层组合（如 Conv-BN, Linear-BN）。
     2. 量化准备：通过符号追踪获取模型的计算图（FX Graph），
-       根据 QConfig 中的设定，在图中的适当位置插入量化节点（Observer/FakeQuant）。
+       根据 QConfig 中的设定，在图中的适当位置插入量化节点（FakeQuantize）。
+       这些 FakeQuantize 节点将在后续的 PTQ 校准或 QAT 训练中被配置。
 
     主要工作流程集中在 `prepare` 方法中，该方法执行以下操作：
     1. 使用 `torch.fx` 追踪原始模型，生成计算图。
@@ -59,8 +62,8 @@ class Quantizer:
     3. (可选) 调用 `fuse_conv_linear_bn_fx` 函数 (在 graph_utils.py 中) 应用这些融合。
     4. 更新图和模块字典以反映融合后的结构。
     5. 遍历（可能已融合的）计算图中的节点。
-    6. 根据节点的类型和 `QConfig`，插入权重和激活量化器。
-    7. 返回一个修改后的、包含融合层和量化节点的 `torch.fx.GraphModule`。
+    6. 根据节点的类型和 `QConfig`，插入权重和激活量化器（FakeQuantize）。
+    7. 返回一个修改后的、包含融合层和量化节点（FakeQuantize）的 `torch.fx.GraphModule`。
 
     Attributes:
         qconfig (QConfig): 存储量化配置。
@@ -74,7 +77,7 @@ class Quantizer:
         初始化 Quantizer 实例。
 
         Args:
-            qconfig (QConfig): QConfig 实例。
+            qconfig (QConfig): QConfig 实例，指定 FakeQuantize 工厂。
             debug (bool, optional): 是否启用调试日志。默认为 False。
             fuse_bn (bool, optional): 是否在准备阶段自动融合 Conv/Linear-BN 层。
                                       默认为 True。
@@ -128,8 +131,8 @@ class Quantizer:
 
     def prepare(self, model: nn.Module) -> GraphModule:
         """
-        准备模型以进行量化（PTQ 校准或 QAT 训练）。
-        包括可选的 BN 融合和插入观察器/占位符。
+        准备模型以进行量化。
+        包括可选的 BN 融合和插入 FakeQuantize 节点。
         """
         self.logger.info(
             _colorize(
@@ -291,7 +294,7 @@ class Quantizer:
                 modules = dict(prepared_model.named_modules())
                 fusion_executed = False  # 融合未成功执行
 
-        # --- 量化器插入 ---
+        # --- 量化器（FakeQuantize）插入 ---
         # 使用融合（或未融合）后的 graph 和 modules
         self._insertion_point_counter = 0  # 重置插入计数器
         nodes_to_process = list(graph.nodes)  # 基于当前图状态获取节点列表
@@ -379,11 +382,18 @@ class Quantizer:
                     and hasattr(target_module, "weight")  # 融合后的层肯定有 weight
                     and target_module.weight is not None
                 ):
-                    weight_quant_module_cls = self.qconfig.weight
-                    weight_quant_instance = weight_quant_module_cls()
+                    # 从 QConfig 获取 FakeQuantize 工厂函数
+                    weight_quant_factory = self.qconfig.weight
+                    # 调用工厂创建 FakeQuantize 实例
+                    weight_quant_instance = weight_quant_factory()
+                    # 确保创建的是 FakeQuantize (或其子类)
+                    if not isinstance(weight_quant_instance, FakeQuantize):
+                        raise TypeError(
+                            f"QConfig.weight 工厂必须返回 FakeQuantize 实例，但得到 {type(weight_quant_instance)}"
+                        )
                     # 使用融合后模块的名称生成观察器名称
                     quant_module_name = self._get_unique_module_name(
-                        f"weight_quant_{target_key.replace('.', '_')}"
+                        f"weight_fake_quant_{target_key.replace('.', '_')}"
                     )
                     # 在 prepared_model (可能已融合) 上添加模块
                     prepared_model.add_module(quant_module_name, weight_quant_instance)
@@ -467,11 +477,11 @@ class Quantizer:
                     current_module = modules.get(target_key)
                     # 检查是否是 QConfig 中定义的激活或权重量化器实例
                     is_act_quant_inst = self.qconfig.activation and isinstance(
-                        current_module, self.qconfig.activation
+                        current_module, FakeQuantize
                     )
                     # 权重观察器后面通常不需要再加激活观察器
                     is_wt_quant_inst = self.qconfig.weight and isinstance(
-                        current_module, self.qconfig.weight
+                        current_module, FakeQuantize
                     )
                     if is_act_quant_inst or is_wt_quant_inst:
                         is_output_from_quant_module = True
@@ -496,7 +506,9 @@ class Quantizer:
                         ):
                             should_quantize_output = True
                             target_str_safe = target_key.replace(".", "_")
-                            output_prefix = f"act_quant_after_mod_{target_str_safe}"
+                            output_prefix = (
+                                f"act_fake_quant_after_mod_{target_str_safe}"
+                            )
                             origin_node_desc = f"模块 '{_colorize(target_key, COLOR_MODULE)}' ({type(target_module).__name__})"
                             reason_for_quantization = f"{origin_node_desc} 的输出"
                     # else: # 如果模块不在字典里（如被融合的 BN），自然不需要为其输出加观察器
@@ -507,7 +519,7 @@ class Quantizer:
                     ):
                         should_quantize_output = True
                         func_name = getattr(node.target, "__name__", str(node.target))
-                        output_prefix = f"act_quant_after_func_{func_name}"
+                        output_prefix = f"act_fake_quant_after_func_{func_name}"
                         origin_node_desc = (
                             f"函数 '{_colorize(func_name, COLOR_OPERATOR)}'"
                         )
@@ -518,7 +530,7 @@ class Quantizer:
                     method_name = target_key  # 对于 call_method, target 是方法名字符串
                     if is_quantizable_activation_method(method_name):
                         should_quantize_output = True
-                        output_prefix = f"act_quant_after_method_{method_name}"
+                        output_prefix = f"act_fake_quant_after_method_{method_name}"
                         origin_node_desc = (
                             f"方法 '{_colorize(method_name, COLOR_OPERATOR)}'"
                         )
@@ -526,14 +538,14 @@ class Quantizer:
                     # elif self.debug: # 不可量化的method的debug信息
                     #      self.logger.debug(...)
                 elif node.op == "placeholder":
-                    # 输入占位符通常需要观察，除非其用户已经是观察器
+                    # 输入占位符通常需要量化，除非其用户已经是量化器
                     already_quantized_by_user = False
                     for user in node.users:
                         user_target_key = str(user.target)
                         if user.op == "call_module" and user_target_key in modules:
                             user_module = modules.get(user_target_key)
                             if self.qconfig.activation and isinstance(
-                                user_module, self.qconfig.activation
+                                user_module, FakeQuantize
                             ):
                                 already_quantized_by_user = True
                                 if self.debug:
@@ -547,7 +559,7 @@ class Quantizer:
                     if not already_quantized_by_user:
                         should_quantize_output = True
                         # node.target 是占位符的名称 (例如 'x')
-                        output_prefix = f"act_quant_input_{node.target}"
+                        output_prefix = f"act_fake_quant_input_{node.target}"
                         origin_node_desc = (
                             f"输入 '{_colorize(node.target, COLOR_INPUT)}'"
                         )
@@ -566,7 +578,7 @@ class Quantizer:
                     if user.op == "call_module" and user_target_key in modules:
                         user_module = modules.get(user_target_key)
                         # 如果用户节点本身就是激活观察器
-                        if isinstance(user_module, self.qconfig.activation):
+                        if isinstance(user_module, FakeQuantize):
                             is_already_quantized_by_user = True
                             if self.debug:
                                 self.logger.debug(
@@ -579,8 +591,12 @@ class Quantizer:
                             break
 
                 if not is_already_quantized_by_user:
-                    act_quant_module_cls = self.qconfig.activation
-                    act_quant_instance = act_quant_module_cls()
+                    act_quant_factory = self.qconfig.activation
+                    act_quant_instance = act_quant_factory()
+                    if not isinstance(act_quant_instance, FakeQuantize):
+                        raise TypeError(
+                            f"QConfig.activation 工厂必须返回 FakeQuantize 实例，但得到 {type(act_quant_instance)}"
+                        )
                     quant_module_name = self._get_unique_module_name(output_prefix)
                     prepared_model.add_module(quant_module_name, act_quant_instance)
 
