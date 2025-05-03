@@ -1,22 +1,11 @@
+# micronet/compression/fx/quantization/core/observer.py
+
 from typing import Tuple
 
 import torch
 import torch.nn as nn
 
-
-# 定义量化范围辅助函数
-def _calculate_qmin_qmax(dtype: torch.dtype) -> Tuple[int, int]:
-    """根据数据类型计算量化范围 [qmin, qmax]。"""
-    if dtype == torch.quint8:
-        qmin, qmax = 0, 255
-    elif dtype == torch.qint8:
-        qmin, qmax = -128, 127
-    elif dtype == torch.qint32:
-        qmin, qmax = -2147483648, 2147483647
-    # 可以根据需要添加更多类型，例如 float16 的模拟范围等
-    else:
-        raise ValueError(f"不支持的量化数据类型: {dtype}")
-    return qmin, qmax
+from .quant_utils import calculate_qmin_qmax
 
 
 class MinMaxObserver(nn.Module):
@@ -101,66 +90,73 @@ class MinMaxObserver(nn.Module):
             Tuple[torch.Tensor, torch.Tensor]: 计算得到的 scale 和 zero_point。
                                                 返回的是标量张量。
         """
-        # 获取量化范围 qmin, qmax
-        qmin, qmax = _calculate_qmin_qmax(self.dtype)
+        # 获取量化范围 qmin, qmax (整数形式)
+        qmin_raw, qmax_raw = calculate_qmin_qmax(self.dtype, self.reduce_range)
+        # 将它们转换为浮点数以便计算
+        qmin = float(qmin_raw)
+        qmax = float(qmax_raw)
 
-        # 如果 reduce_range 为 True，调整 qmax (通常用于对称量化)
-        if self.reduce_range:
-            qmin, qmax = qmin // 2, qmax // 2
+        device = self.min_val.device
+        eps_tensor = torch.tensor(self.eps, device=device, dtype=torch.float32)
 
-        # 处理 min_val 和 max_val 相等的情况（例如常数输入）
-        min_val_actual = torch.min(
-            self.min_val, torch.tensor(0.0, device=self.min_val.device)
-        )
-        max_val_actual = torch.max(
-            self.max_val, torch.tensor(0.0, device=self.max_val.device)
-        )
+        # 1. 检查原始 min 和 max 是否相等
+        if torch.isclose(self.min_val, self.max_val, atol=self.eps):
+            # 如果原始 min/max 相等 (包括 == 0 和 != 0 的情况)
+            # 统一使用 scale=1 作为约定
+            scale = torch.tensor(1.0, device=device, dtype=torch.float32)
+            # Zero point: 对称设为0，非对称设为qmin
+            zero_point_val = 0.0 if self.qscheme == torch.per_tensor_symmetric else qmin
+            zero_point = torch.tensor(
+                int(round(zero_point_val)), dtype=torch.int64, device=device
+            )
 
-        # 如果 min == max，或者范围非常接近 0，则需要特殊处理以避免 scale 为 0 或 inf
-        if torch.isclose(min_val_actual, max_val_actual, atol=1e-8):
-            # 如果接近 0，设置一个小的默认范围（如 -1 到 1）
-            if torch.isclose(
-                min_val_actual,
-                torch.tensor(0.0, device=min_val_actual.device),
-                atol=1e-8,
-            ):
-                max_val_actual = min_val_actual + 1.0
-            # 否则，稍微扩大范围
-            else:
-                scale = torch.tensor(1.0, device=min_val_actual.device)
-                zero_point = torch.tensor(
-                    0 if self.qscheme == torch.per_tensor_symmetric else qmin,
-                    dtype=torch.int64,
-                    device=min_val_actual.device,
-                )
-                # print(f"  [Observer {id(self)}] Calc (min==max): scale={scale:.4f}, zp={zero_point}")
-                return scale, zero_point
-
-        # --- 计算 Scale ---
-        # (max - min) / (qmax - qmin)
-        scale = (max_val_actual - min_val_actual) / float(qmax - qmin)
-        # 确保 scale 不为 0 (加上 eps)
-        scale = torch.max(scale, torch.tensor(self.eps, device=scale.device))
-
-        # --- 计算 Zero Point ---
-        if self.qscheme == torch.per_tensor_symmetric:
-            # 对称量化：zero_point 通常为 0 (对于 qint8) 或 128 (对于 quint8，但不常见)
-            # 这里对称量化时 zp 为 0
-            zero_point = torch.tensor(0, dtype=torch.int64, device=scale.device)
-        elif self.qscheme == torch.per_tensor_affine:
-            # 非对称量化：zero_point = qmin - round(min_val / scale)
-            # 使用浮点 zero_point 计算，然后四舍五入并 clamp 到 [qmin, qmax]
-            zero_point_float = qmin - (min_val_actual / scale)
-            zero_point = torch.round(zero_point_float).to(torch.int64)
-            # Clamp zero_point 到有效范围
-            zero_point = torch.clamp(zero_point, qmin, qmax)
+            # print(f"  [Observer {id(self)}] Calc (min==max): scale={scale:.4f}, zp={zero_point}")
+            return scale, zero_point
         else:
-            raise ValueError(f"不支持的 qscheme: {self.qscheme}")
+            # 2. 标准计算路径 (min != max)
 
-        # print(f"  [Observer {id(self)}] Calc: min={self.min_val:.4f}, max={self.max_val:.4f} => scale={scale:.4f}, zp={zero_point}")
+            if self.qscheme == torch.per_tensor_symmetric:
+                # --- 对称量化计算 (Symmetric) ---
+                # Zero point 强制为 0 (对于 qint 类型)
+                zero_point = torch.tensor(0, dtype=torch.int64, device=device)
 
-        # 返回标量张量
-        return scale.to(torch.float32), zero_point.to(torch.int64)
+                # Scale 基于最大绝对值计算
+                # 使用 *原始* 观测到的 min/max
+                max_abs_val = torch.max(
+                    torch.abs(self.min_val), torch.abs(self.max_val)
+                )
+
+                # 对称量化的有效量化范围上限 (如 qint8 是 127 或 63)
+                # 注意：这里使用 qmax (已经考虑了 reduce_range)
+                effective_qmax = qmax
+
+                scale = max_abs_val / effective_qmax
+                scale = torch.max(scale, eps_tensor)
+
+                # print(f"  [Observer {id(self)}] Calc SYMMETRIC: max_abs={max_abs_val:.4f} => scale={scale:.4f}, zp={zero_point}")
+
+            else:  # torch.per_tensor_affine
+                # --- 非对称量化计算 (Asymmetric) ---
+                # 确保 0 被包含在范围内
+                zero_tensor = torch.tensor(0.0, device=device)
+                min_val_adj = torch.min(zero_tensor, self.min_val)
+                max_val_adj = torch.max(zero_tensor, self.max_val)
+
+                # 标准非对称 scale
+                scale = (max_val_adj - min_val_adj) / (qmax - qmin)
+                scale = torch.max(scale, eps_tensor)
+
+                # 标准非对称 zero_point (使用调整后的 min/max)
+                zero_point = qmin - torch.round(min_val_adj / scale)
+
+                # 最终将 zero_point 限制在量化范围内 (以防计算误差)
+                # 注意：qmin_raw 和 qmax_raw 是整数类型
+                zero_point = torch.clamp(zero_point, qmin_raw, qmax_raw)
+
+                # print(f"  [Observer {id(self)}] Calc ASYMMETRIC: min={min_val_adj:.4f}, max={max_val_adj:.4f} => scale={scale:.4f}, zp={zero_point}")
+
+            # 返回标量张量
+            return scale.to(torch.float32), zero_point.to(torch.int64)
 
     def extra_repr(self) -> str:
         """为打印模块信息提供额外细节。"""

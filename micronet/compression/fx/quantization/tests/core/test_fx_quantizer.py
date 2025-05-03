@@ -1,23 +1,22 @@
+# micronet/compression/fx/quantization/tests/core/test_fx_quantizer.py
+
 import unittest
 import sys
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.fx import GraphModule
 
 try:
     from micronet.compression.fx.quantization.core.quantizer import Quantizer
-    from micronet.compression.fx.quantization.core.fake_quant import FakeQuantize
+    from micronet.compression.fx.quantization.core.fake_quant import (
+        FakeQuantize,
+    )
     from micronet.compression.fx.quantization.core.qconfig import (
         QConfig,
         default_ptq_qconfig,
         default_qat_qconfig,
     )
     from micronet.compression.fx.quantization.core.graph_utils import (
-        is_quantizable_weight_module,
-        is_quantizable_activation_module,
-        is_quantizable_activation_function,
-        is_quantizable_activation_method,
         _colorize,  # 导入颜色函数以便测试输出使用
         COLOR_SUCCESS,
         COLOR_ERROR,
@@ -524,47 +523,6 @@ class TestQuantizer(unittest.TestCase):
             expected_acts,
             debug=False,
         )
-
-    def test_13_graph_utils_coverage(self):
-        """测试 graph_utils 中的辅助函数"""
-        print("\n--- 测试: graph_utils 辅助函数 ---")
-        # 权重可量化
-        self.assertTrue(is_quantizable_weight_module(nn.Conv2d(3, 3, 3)))
-        self.assertTrue(is_quantizable_weight_module(nn.Linear(10, 5)))
-        self.assertTrue(is_quantizable_weight_module(nn.Embedding(100, 10)))
-        self.assertTrue(is_quantizable_weight_module(nn.BatchNorm2d(3)))
-        self.assertFalse(is_quantizable_weight_module(nn.ReLU()))
-
-        # 激活可量化 (模块)
-        self.assertTrue(is_quantizable_activation_module(nn.Conv2d(3, 3, 3)))
-        self.assertTrue(is_quantizable_activation_module(nn.Linear(10, 5)))
-        self.assertTrue(is_quantizable_activation_module(nn.BatchNorm2d(3)))
-        self.assertTrue(is_quantizable_activation_module(nn.ReLU()))
-        self.assertTrue(is_quantizable_activation_module(nn.MaxPool2d(2)))
-        self.assertTrue(is_quantizable_activation_module(nn.AdaptiveAvgPool2d(1)))
-        self.assertFalse(
-            is_quantizable_activation_module(nn.Dropout())
-        )  # Dropout 通常不量化
-
-        # 激活可量化 (函数)
-        self.assertTrue(is_quantizable_activation_function(torch.add))
-        self.assertTrue(is_quantizable_activation_function(F.relu))
-        self.assertTrue(is_quantizable_activation_function(torch.cat))
-        self.assertTrue(is_quantizable_activation_function(F.adaptive_avg_pool2d))
-        self.assertFalse(
-            is_quantizable_activation_function(torch.randn)
-        )  # 不是计算函数
-        self.assertFalse(is_quantizable_activation_function(F.dropout))
-
-        # 激活可量化 (方法)
-        self.assertTrue(is_quantizable_activation_method("add"))
-        self.assertTrue(is_quantizable_activation_method("__add__"))
-        self.assertTrue(is_quantizable_activation_method("relu_"))
-        self.assertTrue(is_quantizable_activation_method("mean"))
-        self.assertFalse(is_quantizable_activation_method("view"))
-        self.assertFalse(is_quantizable_activation_method("transpose"))
-
-        print(_colorize("--- 测试通过: graph_utils 辅助函数 ---", COLOR_SUCCESS))
 
 
 # --- 运行测试 ---

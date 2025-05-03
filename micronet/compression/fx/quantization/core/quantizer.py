@@ -1,3 +1,5 @@
+# micronet/compression/fx/quantization/core/quantizer.py
+
 import copy
 import logging
 import sys
@@ -47,40 +49,125 @@ if not logger.hasHandlers():
 
 class Quantizer:
     """
-    管理使用 torch.fx 对 PyTorch 模型进行量化准备和优化的核心类。
+    **核心功能:**
+    自动化地将一个标准的 PyTorch `nn.Module` 模型转换为适合进行量化（PTQ 或 QAT）的
+    `torch.fx.GraphModule` 结构。
 
-    此类负责接收一个原始的 nn.Module 模型和一个 QConfig 量化配置对象。
-    它的主要功能包括：
-    1. (可选) 模型融合：自动检测并融合常见的层组合（如 Conv-BN, Linear-BN）。
-    2. 量化准备：通过符号追踪获取模型的计算图（FX Graph），
-       根据 QConfig 中的设定，在图中的适当位置插入量化节点（FakeQuantize）。
-       这些 FakeQuantize 节点将在后续的 PTQ 校准或 QAT 训练中被配置。
+    **工作目标:**
+    此类旨在解决手动修改模型以适应量化流程的复杂性和易错性。它通过分析模型的计算图，
+    并根据用户提供的量化配置 (`QConfig`)，在图的关键位置自动插入“伪量化”节点
+    (`FakeQuantize`)。这些节点在后续的量化流程中起着至关重要的作用。
 
-    主要工作流程集中在 `prepare` 方法中，该方法执行以下操作：
-    1. 使用 `torch.fx` 追踪原始模型，生成计算图。
-    2. (可选) 遍历图，自动识别可融合的 Conv/Linear -> BatchNorm 模式。
-    3. (可选) 调用 `fuse_conv_linear_bn_fx` 函数 (在 graph_utils.py 中) 应用这些融合。
-    4. 更新图和模块字典以反映融合后的结构。
-    5. 遍历（可能已融合的）计算图中的节点。
-    6. 根据节点的类型和 `QConfig`，插入权重和激活量化器（FakeQuantize）。
-    7. 返回一个修改后的、包含融合层和量化节点（FakeQuantize）的 `torch.fx.GraphModule`。
+    **主要职责与处理流程 (通过 `prepare` 方法实现):**
 
-    Attributes:
-        qconfig (QConfig): 存储量化配置。
-        debug (bool): 控制是否启用详细的调试日志输出。
-        logger (logging.Logger): 用于记录信息的日志记录器。
-        fuse_bn (bool): 控制是否执行 Conv/Linear-BN 融合。
+    1.  **模型表示转换 (符号追踪):**
+        *   使用 `torch.fx.symbolic_trace` 将输入的 PyTorch 模型（Python 代码）转换为
+            一个显式的、可操作的计算图表示 (FX Graph)。这是所有后续操作的基础。
+        *   **注意:** 此过程通常要求模型是 "FX-traceable" 的，即不包含过于复杂的 Python
+            控制流（虽然对简单条件和循环可能有一定支持，但复杂情况可能失败）。追踪
+            总是在 `eval()` 模式下进行。
+
+    2.  **模型结构优化 (可选的 BN 融合):**
+        *   如果 `fuse_bn=True` (默认行为依赖于初始化设置)，则会自动扫描追踪后的图，
+            查找常见的、可融合的模式，主要是卷积层 (Conv1d/2d/3d) 或线性层 (Linear)
+            紧跟着批归一化层 (BatchNorm1d/2d/3d)。
+        *   识别出的模式会被融合：将 BN 层的计算（缩放和平移）合并到前面的
+            Conv/Linear 层的权重和偏置中。这可以减少计算量并提高量化后的精度。
+        *   融合操作会直接修改 FX Graph 和关联的模块实例。
+
+    3.  **量化节点插入 (核心逻辑):**
+        *   遍历（可能已融合的）FX Graph 中的每个节点。
+        *   **权重 (`weight`) 量化:**
+            *   识别出定义在 `graph_utils.is_quantizable_weight_module` 中的可量化层
+              (如 `nn.Conv2d`, `nn.Linear`)。
+            *   如果用户在 `QConfig` 中提供了 `weight` 的 `FakeQuantize` 工厂函数，
+              则会为该层的 `weight` 属性创建一个 `FakeQuantize` 实例。
+            *   在图中插入对这个 `FakeQuantize` 模块的调用，使其作用于原始权重。
+            *   修改原始层节点的输入，使其使用伪量化后的权重。
+        *   **激活 (`activation`) 量化:**
+            *   识别出定义在 `graph_utils.is_quantizable_activation_*` 中的层、函数
+              或方法 (如 `nn.ReLU`, `torch.add`, `tensor.relu`) 的输出，以及模型的
+              输入占位符 (`placeholder`)。
+            *   如果用户在 `QConfig` 中提供了 `activation` 的 `FakeQuantize` 工厂函数，
+              则会为这些节点的输出创建一个 `FakeQuantize` 实例。
+            *   在图中，在这些产生需要量化的激活值的节点 *之后* 插入对 `FakeQuantize`
+              模块的调用。
+            *   修改图中所有原来使用该激活值的下游节点，使其转而使用 `FakeQuantize`
+              模块的输出。
+        *   **`FakeQuantize` 的作用:**
+            *   这些插入的 `FakeQuantize` 模块本身是 `nn.Module`。
+            *   它们的核心功能是 *模拟* 量化操作（量化 -> 钳位 -> 反量化），但输入
+              输出仍然是浮点数。
+            *   它们内部通常包含一个 `Observer`，用于在 PTQ 校准阶段收集数据的
+              统计信息 (min/max)。
+            *   它们也包含 `scale` 和 `zero_point` 参数。在 QAT 阶段，这些参数可以
+              被设置为可学习的 (`nn.Parameter`)，并通过反向传播进行优化。
+            *   在 QAT 中，它们使用直通估计器 (STE) 来允许梯度流过不可导的量化操作。
+
+    4.  **图的最终处理与返回:**
+        *   在所有修改完成后，对图进行验证 (`lint`) 确保其结构有效。
+        *   将最终的 FX Graph 和更新后的模块字典重新包装成一个新的
+            `torch.fx.GraphModule` 实例。
+        *   返回这个准备好的 `GraphModule`。**重要的是，原始输入模型不会被修改。**
+
+    **用户需要提供的关键信息 (`QConfig` 或 `QConfigMapping`):**
+    `QConfig` 对象 (或更灵活的 `QConfigMapping`) 是指导 `Quantizer` 如何插入
+    `FakeQuantize` 节点的蓝图。它至少需要指定：
+    *   `activation`: 一个工厂函数 (或类)，当被调用时，返回一个用于激活量化的
+                     `FakeQuantize` 实例 (或者 `None` 表示不量化激活)。
+    *   `weight`: 一个工厂函数 (或类)，当被调用时，返回一个用于权重量化的
+                  `FakeQuantize` 实例 (或者 `None` 表示不量化权重)。
+    `QConfigMapping` 允许对不同类型的模块或特定名称的模块指定不同的量化配置，提供
+    比单一 `QConfig` 更精细的控制。
+
+    **关键属性 (Attributes):**
+    *   `qconfig` (`Union[QConfig, QConfigMapping]`):
+        存储传递给构造函数的量化配置。这决定了哪些模块/操作会被量化以及如何量化
+        (即使用哪个 `FakeQuantize` 工厂)。
+    *   `debug` (`bool`):
+        控制是否启用详细的调试日志输出。如果为 `True`，则在控制台打印追踪、融合
+        和量化节点插入过程中的详细信息，便于问题排查。
+    *   `fuse_bn` (`bool`):
+        指示在准备过程中是否应自动执行 Conv/Linear -> BatchNorm 的融合操作。
+        如果为 `True`，`prepare` 方法会调用 `graph_utils.fuse_conv_linear_bn_fx`
+        来优化模型结构。
+
+    **使用场景与上下文:**
+    `Quantizer` 通常是整个量化工作流的第一步（准备阶段）。
+    *   **对于 PTQ (Post-Training Quantization):**
+        1.  **准备:** 使用 `Quantizer(qconfig).prepare(model)` 得到 `prepared_model`。
+        2.  **校准:** 将 `prepared_model` 设置为 `eval()` 模式，通过 `enable_observer(True)`
+            和 `enable_fake_quant(False)` 激活 `FakeQuantize` 中的 Observer。然后用
+            代表性的校准数据集运行 `prepared_model`，让 Observer 收集统计信息。
+        3.  **计算参数:** 对 `prepared_model` 中的每个 `FakeQuantize` 调用
+            `calculate_qparams()`，将收集到的统计信息转换为固定的 `scale` 和 `zero_point`。
+        4.  **转换/评估:** 可以选择性地将 `prepared_model` 转换为真正的量化模型
+            (例如，替换为 `nn.quantized` 模块)，或者在 `eval()` 模式下保持
+            `FakeQuantize` 启用 (`enable_fake_quant(True)`) 来评估模拟量化后的精度。
+    *   **对于 QAT (Quantization-Aware Training):**
+        1.  **准备:** 使用 `Quantizer(qconfig).prepare(model)` 得到 `prepared_model`。
+        2.  **进入 QAT 模式:** 对 `prepared_model` 中的每个 `FakeQuantize` 调用
+            `enable_qat(True, ...)`，启用伪量化，根据 QAT 模式配置 Observer 和
+            `scale`/`zp` 的学习状态。
+        3.  **训练:** 像训练普通模型一样训练 `prepared_model`。`FakeQuantize` 会模拟
+            量化效应，并通过 STE 进行梯度反传。
+        4.  **转换/评估:** 训练完成后，可以将模型转换为真正的量化模型或进行评估。
+
+    **总结:** `Quantizer` 是一个利用 `torch.fx` 实现的、高度自动化的模型准备工具，
+    它通过智能地插入 `FakeQuantize` 节点，为后续的 PTQ 校准或 QAT 训练铺平了道路，
+    极大地简化了模型量化的准备工作。
     """
 
     def __init__(self, qconfig: QConfig, debug: bool = False, fuse_bn: bool = False):
         """
-        初始化 Quantizer 实例。
+        初始化 Quantizer。
 
         Args:
-            qconfig (QConfig): QConfig 实例，指定 FakeQuantize 工厂。
-            debug (bool, optional): 是否启用调试日志。默认为 False。
-            fuse_bn (bool, optional): 是否在准备阶段自动融合 Conv/Linear-BN 层。
-                                      默认为 True。
+            qconfig (Union[QConfig, QConfigMapping]): 量化配置。可以是应用于所有可量化
+                层的单个 QConfig，也可以是用于更精细控制的 QConfigMapping。
+            debug (bool, optional): 是否启用详细日志输出。默认为 False。
+            fuse_bn (bool, optional): 是否在 prepare 阶段自动融合 Conv/Linear 和 BatchNorm。
+                                     默认为 True。
         """
         if not isinstance(qconfig, QConfig):
             raise ValueError("qconfig 必须是 QConfig 的实例")

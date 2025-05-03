@@ -1,3 +1,5 @@
+# micronet/compression/fx/quantization/core/qconfig.py
+
 import torch
 import torch.nn as nn
 from dataclasses import dataclass
@@ -155,14 +157,18 @@ class QConfigMapping:
             key: 模块类型或对象名称（FQN 字符串）。
 
         Returns:
-            与键关联的 QConfig，如果未直接设置则返回 None。
+            与键关联的 QConfig，如果未直接设置则抛出 KeyError。
         """
         if isinstance(key, str):
-            return self._object_name_qconfigs.get(key)
-        # 需要检查 key 是否真的是一个类型，并且是 nn.Module 的子类
+            if key in self._object_name_qconfigs:
+                return self._object_name_qconfigs[key]
+            else:
+                raise KeyError(f"对象名称 '{key}' 未在映射中直接设置。")
         elif isinstance(key, type) and issubclass(key, nn.Module):
-
-            return self._module_type_qconfigs.get(key)
+            if key in self._module_type_qconfigs:
+                return self._module_type_qconfigs[key]
+            else:
+                raise KeyError(f"模块类型 '{key.__name__}' 未在映射中直接设置。")
         else:
             raise TypeError(f"不支持的键类型: {type(key)}")
 
@@ -172,37 +178,36 @@ class QConfigMapping:
         """
         根据优先级规则获取给定模块的有效 QConfig。
 
+        优先级顺序 (从高到低):
+        1. 按对象名称 (FQN) 查找精确匹配。
+        2. 按模块类型查找。
+        3. 使用全局 QConfig。
+
+        如果一个模块在某个优先级级别被显式配置为 None，则表示禁用该模块的量化，
+        查找过程会停止并返回 None，不会继续查找更低优先级的配置。
+
         Args:
             module_type: 模块的类类型。
             object_name: 模块的 FQN（可选）。
 
         Returns:
-            应用于此模块的 QConfig (可能是 None)，或全局 QConfig。
-            如果所有级别都没有找到配置，则返回 None。
+            应用于此模块的 QConfig (可能是 None)。如果所有级别都没有找到匹配，
+            或者找到了明确的 None 配置，则返回 None。
         """
-        # 1. 按对象名称查找
+        # 优先级 1: 按对象名称查找
         if object_name is not None and object_name in self._object_name_qconfigs:
-            return self._object_name_qconfigs[
-                object_name
-            ]  # 如果值为 None，表示明确禁用
+            # 如果找到，立即返回 (可能是 QConfig 实例或 None)
+            return self._object_name_qconfigs[object_name]
 
-        # 2. 按模块类型查找
-        # 更鲁棒的方式是检查 MRO (方法解析顺序)
-        qconfig_found = None
-        # 这里我们简化为直接匹配，但实际可能需要遍历 mro
-        # for m_type in self._module_type_qconfigs:
-        #    if issubclass(module_type, m_type):
-        #        # 需要处理找到多个匹配的情况，例如取最具体的
-        #        qconfig_found = self._module_type_qconfigs[m_type]
-        #        break # 简化，找到第一个就用
+        # 优先级 2: 按模块类型查找
+        # (这里简化为直接匹配，更复杂的实现可以考虑 MRO)
         if module_type in self._module_type_qconfigs:
-            qconfig_found = self._module_type_qconfigs[module_type]
+            # 如果找到，立即返回 (可能是 QConfig 实例或 None)
+            return self._module_type_qconfigs[module_type]
 
-        if qconfig_found is not None:  # 如果找到了，无论是 QConfig 还是 None，都用它
-            return qconfig_found
-        # 如果类型查找返回 None (即没有为该类型设置特定规则)，继续检查全局
+        # 如果以上级别都没有找到明确的配置 (包括 None)
 
-        # 3. 返回全局配置
+        # 优先级 3: 返回全局配置
         return self._global_qconfig
 
 
