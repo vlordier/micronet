@@ -311,22 +311,22 @@ class FakeQuantize(nn.Module):
     *   `[INACTIVE]`: 模块不起作用，相当于 Identity。
     """
 
-    # 使用 slots 优化内存
-    __slots__ = [
-        "observer",
-        "scale",
-        "zero_point",
-        "dtype",
-        "qscheme",
-        "quant_min",
-        "quant_max",
-        "eps",
-        "observer_enabled",
-        "fake_quant_enabled",
-        "is_qat_learning",  # 表示是否处于 QAT 阶段 (学习或统计)
-        "qat_mode",  # QAT 期间的具体模式
-        "ema_alpha",  # EMA 更新因子 (如果使用 HYBRID_EMA)
-    ]
+    # # 使用 slots 优化内存
+    # __slots__ = [
+    #     "observer",
+    #     "scale",
+    #     "zero_point",
+    #     "dtype",
+    #     "qscheme",
+    #     "quant_min",
+    #     "quant_max",
+    #     "eps",
+    #     "observer_enabled",
+    #     "fake_quant_enabled",
+    #     "is_qat_learning",  # 表示是否处于 QAT 阶段 (学习或统计)
+    #     "qat_mode",  # QAT 期间的具体模式
+    #     "ema_alpha",  # EMA 更新因子 (如果使用 HYBRID_EMA)
+    # ]
 
     def __init__(
         self,
@@ -359,15 +359,20 @@ class FakeQuantize(nn.Module):
         """
         super().__init__()
 
+        # 保存核心配置作为实例属性，以便序列化和 deepcopy
+        self.observer_cls = observer_cls
+        self.dtype = dtype
+        self.qscheme = qscheme
+        self.reduce_range = reduce_range
+        self.eps = eps
+
         # 实例化内部 Observer
+        # 需要确保 observer_cls 是类型
+        if not isinstance(observer_cls, type):
+            raise TypeError(f"observer_cls must be a type, got {observer_cls}")
         self.observer = observer_cls(
             dtype=dtype, qscheme=qscheme, reduce_range=reduce_range, eps=eps
         )
-
-        # 保存核心配置作为实例属性，以便序列化和 deepcopy
-        self.dtype = dtype
-        self.qscheme = qscheme
-        self.eps = eps
 
         # 获取量化范围 [qmin, qmax]
         # calculate_qmin_qmax 是一个辅助函数，根据 dtype 和 reduce_range 返回整数范围
@@ -649,10 +654,10 @@ class FakeQuantize(nn.Module):
     def __deepcopy__(self, memo):
         # 创建一个新的实例，具有相同的初始化参数
         new_instance = FakeQuantize(
-            observer_cls=type(self.observer),
+            observer_cls=self.observer_cls,
             dtype=self.dtype,
             qscheme=self.qscheme,
-            reduce_range=getattr(self.observer, "reduce_range", False),
+            reduce_range=self.reduce_range,
             initial_scale=self.scale.item(),
             initial_zero_point=int(round(self.zero_point.item())),
             eps=self.eps,
@@ -670,16 +675,106 @@ class FakeQuantize(nn.Module):
         if hasattr(self.observer, "state_dict") and hasattr(
             new_instance.observer, "load_state_dict"
         ):
+            # 尝试使用 state_dict 复制 observer 状态 (适用于 buffers/params)
             new_instance.observer.load_state_dict(self.observer.state_dict())
         elif hasattr(self.observer, "min_val") and hasattr(
             new_instance.observer, "min_val"
-        ):  # 对 MinMaxObserver 特殊处理
-            new_instance.observer.min_val.copy_(self.observer.min_val)
-            new_instance.observer.max_val.copy_(self.observer.max_val)
+        ):  # MinMax 特殊处理
+            with torch.no_grad():  # 确保在无梯度上下文复制 buffer
+                new_instance.observer.min_val.copy_(self.observer.min_val)
+                new_instance.observer.max_val.copy_(self.observer.max_val)
 
         # 复制 Parameter 的状态 (值和 requires_grad)
-        new_instance.scale.data.copy_(self.scale.data)
-        new_instance.zero_point.data.copy_(self.zero_point.data)
+        with torch.no_grad():  # 确保在无梯度上下文复制 Parameter 数据
+            new_instance.scale.data.copy_(self.scale.data)
+            new_instance.zero_point.data.copy_(self.zero_point.data)
         new_instance._update_param_learning_state()  # 确保 requires_grad 状态正确
 
         return new_instance
+
+    def __getstate__(self):
+        """定义序列化时需要保存的状态。"""
+        # 这个方法在调用 torch.save(fake_quant_instance, ...) 时被触发。
+        # 它需要返回一个字典，包含所有恢复这个 FakeQuantize 实例状态所需的信息。
+        # 我们需要保存:
+        # 1. 模块的 state_dict: 包含 scale, zero_point 和 observer 的 buffers (min_val, max_val)。
+        # 2. 初始化时所需的配置参数: observer_cls, dtype, qscheme, reduce_range, eps。
+        # 3. 内部的状态标志: observer_enabled, fake_quant_enabled, is_qat_learning, qat_mode, ema_alpha。
+        state = {
+            # 1. 参数和缓冲区
+            "state_dict": self.state_dict(),
+            # 2. 配置信息
+            "observer_cls": self.observer_cls,
+            "dtype": self.dtype,
+            "qscheme": self.qscheme,
+            "reduce_range": self.reduce_range,  # observer 的配置
+            "eps": self.eps,
+            # 3. 内部状态标志
+            "observer_enabled": self.observer_enabled,
+            "fake_quant_enabled": self.fake_quant_enabled,
+            "is_qat_learning": self.is_qat_learning,
+            "qat_mode": self.qat_mode,
+            "ema_alpha": self.ema_alpha,
+            # quant_min/max 可以从 dtype 和 reduce_range 推断，无需保存
+        }
+        return state
+
+    def __setstate__(self, state):
+        """定义从序列化数据恢复对象状态的逻辑。"""
+        # 这个方法在调用 torch.load(...) 加载 FakeQuantize 实例时被触发。
+        # 它接收 __getstate__ 返回的字典 `state`。
+        # 我们需要用这个字典来重建实例的状态:
+        # 1. *首先* 调用基类构造函数，确保 nn.Module 的内部结构已初始化。
+        # 2. 恢复核心配置信息。
+        # 3. 恢复内部的状态标志。
+        # 4. 推导 quant_min/max。
+        # 5. 使用恢复的配置重新创建内部的 observer 实例。
+        # 6. 加载 state_dict 以恢复 scale, zero_point 和 observer 的 buffers。
+        # 7. 根据恢复的状态更新参数的 requires_grad。
+
+        # 1. 调用基类构造函数，确保 nn.Module 的内部结构已初始化
+        super(FakeQuantize, self).__init__()
+
+        # 2. 恢复核心配置
+        self.observer_cls = state["observer_cls"]
+        self.dtype = state["dtype"]
+        self.qscheme = state["qscheme"]
+        self.reduce_range = state["reduce_range"]
+        self.eps = state["eps"]
+
+        # 3. 恢复内部状态标志
+        self.observer_enabled = state["observer_enabled"]
+        self.fake_quant_enabled = state["fake_quant_enabled"]
+        self.is_qat_learning = state["is_qat_learning"]
+        self.qat_mode = state["qat_mode"]
+        self.ema_alpha = state["ema_alpha"]
+
+        # 4. 推导 quant_min/max (它们不在 state 中)
+        self.quant_min, self.quant_max = calculate_qmin_qmax(
+            self.dtype, self.reduce_range
+        )
+
+        # 5. 重建 Observer (参数和缓冲区还未加载)
+        # 需要确保 observer_cls 是 Type
+        if not isinstance(self.observer_cls, type):
+            raise TypeError(f"Loaded observer_cls is not a type: {self.observer_cls}")
+        self.observer = self.observer_cls(
+            dtype=self.dtype,
+            qscheme=self.qscheme,
+            reduce_range=self.reduce_range,
+            eps=self.eps,
+        )
+
+        # 6. 加载 state_dict (必须在 observer 和参数对象存在之后)
+        # 注意：nn.Module 的默认加载过程可能已经创建了 scale/zero_point Parameter，
+        # 但为了安全，我们检查一下。如果它们不存在，load_state_dict 会失败。
+        # 通常情况下，PyTorch 的 unpickling 会处理 Parameter 的创建。
+        if not hasattr(self, "scale"):
+            self.scale = Parameter(torch.tensor(1.0))  # 临时值
+        if not hasattr(self, "zero_point"):
+            self.zero_point = Parameter(torch.tensor(0.0))  # 临时值
+        # 载入 scale, zero_point 的值和 observer 的 buffers (min_val, max_val)
+        self.load_state_dict(state["state_dict"])
+
+        # 7. 更新 requires_grad 状态
+        self._update_param_learning_state()

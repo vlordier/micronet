@@ -6,6 +6,7 @@ import torch.nn as nn
 from torch.nn.parameter import Parameter
 from typing import Type
 import copy
+import io
 
 from micronet.compression.fx.quantization.core.fake_quant import (
     FakeQuantize,
@@ -48,6 +49,7 @@ def qat_learning_fake_quant(default_observer_cls, device) -> FakeQuantize:
         observer_cls=default_observer_cls,
         dtype=torch.qint8,
         qscheme=torch.per_tensor_symmetric,
+        reduce_range=False,
     ).to(
         device
     )  # 移动到设备
@@ -64,7 +66,11 @@ def qat_learning_fake_quant(default_observer_cls, device) -> FakeQuantize:
 @pytest.fixture
 def qat_hybrid_fake_quant(default_observer_cls, device) -> FakeQuantize:
     """提供一个为 QAT HYBRID_EMA 模式配置好的 FakeQuantize 实例"""
-    fq = FakeQuantize(observer_cls=default_observer_cls, dtype=torch.quint8).to(device)
+    fq = FakeQuantize(
+        observer_cls=default_observer_cls,
+        dtype=torch.quint8,
+        reduce_range=False,
+    ).to(device)
     fq.enable_qat(
         enabled=True, qat_mode=QATMode.HYBRID_EMA, inherit_qparams=False, ema_alpha=0.9
     )
@@ -88,9 +94,11 @@ class TestFakeQuantInit:
         """验证：默认初始化时，属性是否符合预期，参数是否在正确设备"""
         fq = default_fake_quant
         assert isinstance(fq.observer, MinMaxObserver)
+        assert fq.observer_cls is MinMaxObserver
         assert fq.dtype == torch.quint8
         assert fq.qscheme == torch.per_tensor_affine
-        assert fq.observer.reduce_range is False  # 从 observer 实例检查
+        assert fq.reduce_range is False
+        assert fq.observer.reduce_range is False
         qmin, qmax = calculate_qmin_qmax(torch.quint8, False)
         assert fq.quant_min == qmin
         assert fq.quant_max == qmax
@@ -123,7 +131,8 @@ class TestFakeQuantInit:
         ).to(device)
         assert fq.dtype == torch.qint8
         assert fq.qscheme == torch.per_tensor_symmetric
-        assert fq.observer.reduce_range is True  # 检查传递给 observer 的参数
+        assert fq.reduce_range is True
+        assert fq.observer.reduce_range is True
         qmin, qmax = calculate_qmin_qmax(torch.qint8, True)
         assert fq.quant_min == qmin
         assert fq.quant_max == qmax
@@ -662,8 +671,10 @@ class TestFakeQuantDeepcopy:
         fq_copy.to(device)  # deepcopy 后可能需要重新移动设备
 
         # 检查基本属性
+        assert fq_copy.observer_cls == fq_orig.observer_cls
         assert fq_copy.dtype == fq_orig.dtype
         assert fq_copy.qscheme == fq_orig.qscheme
+        assert fq_copy.reduce_range == fq_orig.reduce_range
         assert fq_copy.observer.reduce_range == fq_orig.observer.reduce_range
         assert fq_copy.quant_min == fq_orig.quant_min
         assert fq_copy.quant_max == fq_orig.quant_max
@@ -691,3 +702,79 @@ class TestFakeQuantDeepcopy:
         assert id(fq_copy.scale) != id(fq_orig.scale)
         assert id(fq_copy.observer) != id(fq_orig.observer)
         # 如果 observer 有其他非 buffer/param 属性，也要检查是否深拷贝
+
+
+class TestFakeQuantSerialization:
+    """测试 FakeQuantize 的 torch.save 和 torch.load 功能"""
+
+    def test_save_load_preserves_state(
+        self, qat_hybrid_fake_quant: FakeQuantize, device
+    ):
+        """验证：torch.save 和 torch.load 是否能正确保存和恢复状态"""
+        # 1. 获取一个配置好的 FakeQuantize 实例 (qat_hybrid_fake_quant 包含复杂状态)。
+        # 2. 修改一些状态：让 observer 观察数据，手动改变 scale/zp 的值。
+        # 3. 使用 torch.save 将实例保存到内存缓冲区 (io.BytesIO)。
+        # 4. 使用 torch.load 从缓冲区加载回一个新的实例 fq_loaded。
+        # 5. 详细比较 fq_orig 和 fq_loaded 的所有重要属性和状态，确保它们完全一致。
+        #    包括：配置 (dtype, qscheme, eps, reduce_range), 状态标志 (enabled flags, qat_mode),
+        #    参数值 (scale, zp), 参数梯度状态 (requires_grad), observer 内部状态 (min_val, max_val)。
+        # 6. 确保加载后的实例在正确的设备上。
+
+        fq_orig = qat_hybrid_fake_quant
+        # 修改状态
+        fq_orig.observer(torch.tensor([-1.2, 0.8], device=device))
+        with torch.no_grad():
+            fq_orig.scale += 0.01
+            fq_orig.zero_point -= 2.0
+        fq_orig.enable_fake_quant(False)  # 改变一个状态标志
+
+        # 保存到内存
+        buffer = io.BytesIO()
+        torch.save(fq_orig, buffer)
+        buffer.seek(0)  # 重置缓冲区指针到开头
+
+        # 加载
+        fq_loaded = torch.load(buffer)
+        fq_loaded.to(device)  # 加载后可能需要在目标设备上
+
+        # --- 详细比较 ---
+        # 配置
+        assert fq_loaded.observer_cls is fq_orig.observer_cls
+        assert fq_loaded.dtype is fq_orig.dtype
+        assert fq_loaded.qscheme is fq_orig.qscheme
+        assert fq_loaded.reduce_range == fq_orig.reduce_range
+        assert fq_loaded.eps == fq_orig.eps
+        assert fq_loaded.quant_min == fq_orig.quant_min
+        assert fq_loaded.quant_max == fq_orig.quant_max
+        assert type(fq_loaded.observer) is type(fq_orig.observer)  # 检查 observer 类型
+        assert (
+            fq_loaded.observer.reduce_range == fq_orig.observer.reduce_range
+        )  # 检查实例化的 observer
+
+        # 状态标志
+        assert fq_loaded.observer_enabled == fq_orig.observer_enabled
+        assert (
+            fq_loaded.fake_quant_enabled == fq_orig.fake_quant_enabled
+        )  # 应该恢复为 False
+        assert fq_loaded.is_qat_learning == fq_orig.is_qat_learning
+        assert fq_loaded.qat_mode == fq_orig.qat_mode
+        assert fq_loaded.ema_alpha == fq_orig.ema_alpha
+
+        # 参数和 Buffers (比较值)
+        assert torch.equal(fq_loaded.scale.data, fq_orig.scale.data)
+        assert torch.equal(fq_loaded.zero_point.data, fq_orig.zero_point.data)
+        assert torch.equal(fq_loaded.observer.min_val, fq_orig.observer.min_val)
+        assert torch.equal(fq_loaded.observer.max_val, fq_orig.observer.max_val)
+
+        # 参数梯度状态
+        assert fq_loaded.scale.requires_grad == fq_orig.scale.requires_grad
+        assert fq_loaded.zero_point.requires_grad == fq_orig.zero_point.requires_grad
+
+        # 设备检查
+        assert fq_loaded.scale.device == device
+        assert fq_loaded.zero_point.device == device
+        assert fq_loaded.observer.min_val.device == device
+        assert fq_loaded.observer.max_val.device == device
+
+        # 确保不是同一个对象
+        assert id(fq_loaded) != id(fq_orig)
