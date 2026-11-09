@@ -1,0 +1,76 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "micronet"
+version = "1.12.0"
+description = "A model compression and deployment library for deep learning"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.8"
+authors = [
+    {name = "666DZY666", email = "dzy_pku@pku.edu.cn"},
+]
+keywords = [
+    "deep-learning",
+    "model-compression",
+    "quantization",
+    "pruning",
+    "tensorrt",
+    "neural-networks",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries",
+]
+dependencies = [
+    "torch>=1.1.0",
+    "torchvision",
+    "numpy",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/666DZY666/micronet"
+"Repository" = "https://github.com/666DZY666/micronet"
+"Bug Tracker" = "https://github.com/666DZY666/micronet/issues"
+
+[project.scripts]
+micronet = "micronet:quant_test_manual"
+
+[tool.setuptools.packages.find]
+include = ["micronet*"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py38"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "micronet/compression/fx/quantization/tests"]
+addopts = "-v --tb=short"
+
+[tool.coverage.run]
+source = ["micronet"]
+branch = true
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+]
